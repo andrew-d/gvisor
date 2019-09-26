@@ -209,6 +209,11 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 		switch r.ep.state {
 		case StateFinWait1:
 			r.ep.state = StateFinWait2
+			// Notify protocol goroutine that we have received an
+			// ACK to our FIN so that it can start the FIN_WAIT2
+			// timer to abort connection if the other side does
+			// not close within 2MSL.
+			r.ep.notifyProtocolGoroutine(notifyClose)
 		case StateClosing:
 			r.ep.state = StateTimeWait
 		case StateLastAck:
@@ -258,7 +263,9 @@ func (r *receiver) updateRTT() {
 func (r *receiver) handleRcvdSegment(s *segment) {
 	// We don't care about receive processing anymore if the receive side
 	// is closed.
-	if r.closed {
+	// We do want to permit ACKs to allow the last ACK of the TCP shutdown
+	// to transition the socket to the LAST-ACK->CLOSED transition.
+	if r.closed && !(s.data.Size() == 0 && s.flags == header.TCPFlagAck) {
 		return
 	}
 
@@ -266,7 +273,8 @@ func (r *receiver) handleRcvdSegment(s *segment) {
 	segSeq := s.sequenceNumber
 
 	// If the sequence number range is outside the acceptable range, just
-	// send an ACK. This is according to RFC 793, page 37.
+	// send an ACK and stop further processing of the segment.
+	// This is according to RFC 793, page 68.
 	if !r.acceptable(segSeq, segLen) {
 		r.ep.snd.sendAck()
 		return
@@ -315,4 +323,67 @@ func (r *receiver) handleRcvdSegment(s *segment) {
 		r.pendingBufUsed -= s.logicalLen()
 		s.decRef()
 	}
+	return
+}
+
+// handleTimeWaitSegment handles inbound segments received when the endpoint
+// has entered the TIME_WAIT state.
+func (r *receiver) handleTimeWaitSegment(s *segment) (resetTimeWait bool, newSyn bool) {
+	segSeq := s.sequenceNumber
+	segLen := seqnum.Size(s.data.Size())
+
+	// Just silently drop any RST packets in TIME_WAIT. We do not support
+	// TIME_WAIT assasination as a result we confirm w/ fix 1 as described
+	// in https://tools.ietf.org/html/rfc1337#section-3.
+	if s.flagIsSet(header.TCPFlagRst) {
+		return false, false
+	}
+
+	// If it's a SYN and the sequence number is higher than any seen before
+	// for this connection then try and redirect it to a listening endpoint
+	// if available.
+	//
+	// RFC 1122:
+	//   "When a connection is [...] on TIME-WAIT state [...]
+	//   [a TCP] MAY accept a new SYN from the remote TCP to
+	//   reopen the connection directly, if it:
+
+	//    (1) assigns its initial sequence number for the new
+	//     connection to be larger than the largest sequence
+	//     number it used on the previous connection incarnation,
+	//     and
+
+	//    (2) returns to TIME-WAIT state if the SYN turns out
+	//      to be an old duplicate".
+	if s.flagIsSet(header.TCPFlagSyn) && r.rcvNxt.LessThan(segSeq) {
+
+		return false, true
+	}
+
+	// Drop the segment if it does not contain an ACK.
+	if !s.flagIsSet(header.TCPFlagAck) {
+		return false, false
+	}
+
+	// Update Timestamp if required. See RFC7323, section-4.3.
+	if r.ep.sendTSOk && s.parsedOptions.TS {
+		r.ep.updateRecentTimestamp(s.parsedOptions.TSVal, r.ep.snd.maxSentAck, segSeq)
+	}
+
+	if segSeq.Add(1) == r.rcvNxt && s.flagIsSet(header.TCPFlagFin) {
+		// If it's a FIN-ACK then resetTimeWait and send an ACK, as it
+		// indicates our final ACK could have been lost.
+		r.ep.snd.sendAck()
+		return true, false
+	}
+
+	// If the sequence number range is outside the acceptable range or
+	// carries data then just send an ACK. This is according to RFC 793,
+	// page 37.
+	//
+	// NOTE: In TIME_WAIT the only acceptable sequence number is rcvNxt.
+	if segSeq != r.rcvNxt || segLen != 0 {
+		r.ep.snd.sendAck()
+	}
+	return false, false
 }

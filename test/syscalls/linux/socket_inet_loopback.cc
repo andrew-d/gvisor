@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <arpa/inet.h>
+#include <linux/tcp.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include "gtest/gtest.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/syscalls/linux/socket_test_util.h"
 #include "test/util/file_descriptor.h"
@@ -265,6 +267,261 @@ TEST_P(SocketInetLoopbackTest, TCPbacklog) {
     auto accepted =
         ASSERT_NO_ERRNO_AND_VALUE(Accept(listen_fd.get(), nullptr, nullptr));
   }
+}
+
+// TCPFinWait2Test creates a pair of connected sockets then closes one end to
+// trigger FIN_WAIT2 state for the closed endpoint. Then it binds the same local
+// IP/port on a new socket and tries to connect. The connect should fail w/
+// an EADDRINUSE. Then we wait till the FIN_WAIT2 timeout is over and try the
+// connect again with a new socket and this time it should succeed.
+TEST_P(SocketInetLoopbackTest, TCPFinWait2Test) {
+  auto const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  // Create the listening socket.
+  const FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(listener.family(), SOCK_STREAM, IPPROTO_TCP));
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(bind(listen_fd.get(), reinterpret_cast<sockaddr*>(&listen_addr),
+                   listener.addr_len),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(listen_fd.get(), SOMAXCONN), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  socklen_t addrlen = listener.addr_len;
+  ASSERT_THAT(getsockname(listen_fd.get(),
+                          reinterpret_cast<sockaddr*>(&listen_addr), &addrlen),
+              SyscallSucceeds());
+
+  uint16_t const port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  // Connect to the listening socket.
+  FileDescriptor conn_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+  // Lower TIME_WAIT state to 5 seconds for test.
+  constexpr int kTCPLingerTimeout = 5;
+  EXPECT_THAT(setsockopt(conn_fd.get(), IPPROTO_TCP, TCP_LINGER2,
+                         &kTCPLingerTimeout, sizeof(kTCPLingerTimeout)),
+              SyscallSucceedsWithValue(0));
+
+  sockaddr_storage conn_addr = connector.addr;
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd.get(),
+                                  reinterpret_cast<sockaddr*>(&conn_addr),
+                                  connector.addr_len),
+              SyscallSucceeds());
+
+  // Accept the connection.
+  auto accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(listen_fd.get(), nullptr, nullptr));
+
+  // Get the address/port bound by the connecting socket.
+  sockaddr_storage conn_bound_addr;
+  socklen_t conn_addrlen = connector.addr_len;
+  ASSERT_THAT(
+      getsockname(conn_fd.get(), reinterpret_cast<sockaddr*>(&conn_bound_addr),
+                  &conn_addrlen),
+      SyscallSucceeds());
+
+  // close the connecting FD to trigger FIN_WAIT2  on the connected fd.
+  conn_fd.reset();
+
+  // Now bind and connect a new socket.
+  const FileDescriptor conn_fd2 = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+  // TODO(gvisor.dev/issue/1030): Portmanager does not track all 5 tuple
+  //   reservations which causes the bind() to succeed on gVisor but connect
+  //   correctly fails.
+  if (IsRunningOnGvisor()) {
+    ASSERT_THAT(
+        bind(conn_fd2.get(), reinterpret_cast<sockaddr*>(&conn_bound_addr),
+             conn_addrlen),
+        SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(connect)(conn_fd2.get(),
+                                    reinterpret_cast<sockaddr*>(&conn_addr),
+                                    conn_addrlen),
+                SyscallFailsWithErrno(EADDRINUSE));
+  } else {
+    ASSERT_THAT(
+        bind(conn_fd2.get(), reinterpret_cast<sockaddr*>(&conn_bound_addr),
+             conn_addrlen),
+        SyscallFailsWithErrno(EADDRINUSE));
+  }
+
+  // Sleep for an extra second to avoid any race with the port being
+  // made available for reservation.
+  absl::SleepFor(absl::Seconds(kTCPLingerTimeout + 1));
+
+  if (!IsRunningOnGvisor()) {
+    ASSERT_THAT(
+        bind(conn_fd2.get(), reinterpret_cast<sockaddr*>(&conn_bound_addr),
+             conn_addrlen),
+        SyscallSucceeds());
+  }
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd2.get(),
+                                  reinterpret_cast<sockaddr*>(&conn_addr),
+                                  conn_addrlen),
+              SyscallSucceeds());
+}
+
+// TCPConnectionResetAfterClose creates a pair of connected sockets then closes
+// one end to trigger FIN_WAIT2 state for the closed endpoint and waits till
+// the FIN_WAIT2 times out and verifies that the other end got a RST.
+TEST_P(SocketInetLoopbackTest, TCPLinger2ResetAfterClose) {
+  auto const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  // Create the listening socket.
+  const FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(listener.family(), SOCK_STREAM, IPPROTO_TCP));
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(bind(listen_fd.get(), reinterpret_cast<sockaddr*>(&listen_addr),
+                   listener.addr_len),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(listen_fd.get(), SOMAXCONN), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  socklen_t addrlen = listener.addr_len;
+  ASSERT_THAT(getsockname(listen_fd.get(),
+                          reinterpret_cast<sockaddr*>(&listen_addr), &addrlen),
+              SyscallSucceeds());
+
+  uint16_t const port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  // Connect to the listening socket.
+  FileDescriptor conn_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+  sockaddr_storage conn_addr = connector.addr;
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd.get(),
+                                  reinterpret_cast<sockaddr*>(&conn_addr),
+                                  connector.addr_len),
+              SyscallSucceeds());
+
+  // Accept the connection.
+  auto accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(listen_fd.get(), nullptr, nullptr));
+
+  // Lower FIN_WAIT2 state timeout to 5 seconds for test.
+  constexpr int kTCPLingerTimeout = 1;
+  EXPECT_THAT(setsockopt(conn_fd.get(), IPPROTO_TCP, TCP_LINGER2,
+                         &kTCPLingerTimeout, sizeof(kTCPLingerTimeout)),
+              SyscallSucceedsWithValue(0));
+
+  // close the connecting FD to trigger FIN_WAIT2  on the connected fd.
+  conn_fd.reset();
+
+  // Sleep for a bit longer than TCP_LINGER2 timeout.
+  absl::SleepFor(absl::Seconds(kTCPLingerTimeout + 1));
+
+  int data = 1234;
+  // Now send data which should trigger a RST as the other end should
+  // have timed out and closed the socket.
+  EXPECT_THAT(RetryEINTR(send)(accepted.get(), &data, sizeof(data), 0),
+              SyscallSucceeds());
+  // Sleep for a shortwhile to get a RST back.
+  absl::SleepFor(absl::Milliseconds(20));
+
+  // Try writing again and we should get an EPIPE back.
+  EXPECT_THAT(RetryEINTR(send)(accepted.get(), &data, sizeof(data), 0),
+              SyscallFailsWithErrno(EPIPE));
+
+  // Trying to read should return zero as the other end did send
+  // us a FIN. We do it twice to verify that the RST does not cause an
+  // ECONNRESET on the read after EOF has been read by applicaiton.
+  EXPECT_THAT(RetryEINTR(recv)(accepted.get(), &data, sizeof(data), 0),
+              SyscallSucceedsWithValue(0));
+  EXPECT_THAT(RetryEINTR(recv)(accepted.get(), &data, sizeof(data), 0),
+              SyscallSucceedsWithValue(0));
+}
+
+TEST_P(SocketInetLoopbackTest, TCPTimeWaitTest) {
+  auto const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  // Create the listening socket.
+  const FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(listener.family(), SOCK_STREAM, IPPROTO_TCP));
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(bind(listen_fd.get(), reinterpret_cast<sockaddr*>(&listen_addr),
+                   listener.addr_len),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(listen_fd.get(), SOMAXCONN), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  socklen_t addrlen = listener.addr_len;
+  ASSERT_THAT(getsockname(listen_fd.get(),
+                          reinterpret_cast<sockaddr*>(&listen_addr), &addrlen),
+              SyscallSucceeds());
+
+  uint16_t const port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  // Connect to the listening socket.
+  FileDescriptor conn_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+  sockaddr_storage conn_addr = connector.addr;
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd.get(),
+                                  reinterpret_cast<sockaddr*>(&conn_addr),
+                                  connector.addr_len),
+              SyscallSucceeds());
+
+  // Accept the connection.
+  auto accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(listen_fd.get(), nullptr, nullptr));
+
+  // This is not strictly required but in S/R runs the netstack seed
+  // can change leading to the ISN generation being different and
+  // could fail the final connect because the new ISN generated is
+  // less than the highest sequence number used before SAVE.
+  // To prevent a failure in such cases we set a TCP_LINGER2 timeout
+  // that is lot lower than the default connect time out of 30s.
+  //
+  // Remove this setsockopt once the issue below is fixed.
+  // TODO(gvisor.dev/issue/940): S/R portSeed/portHint
+  constexpr int kTCPLingerTimeout = 5;
+  EXPECT_THAT(setsockopt(accepted.get(), IPPROTO_TCP, TCP_LINGER2,
+                         &kTCPLingerTimeout, sizeof(kTCPLingerTimeout)),
+              SyscallSucceedsWithValue(0));
+
+  // Get the address/port bound by the connecting socket.
+  sockaddr_storage conn_bound_addr;
+  socklen_t conn_addrlen = connector.addr_len;
+  ASSERT_THAT(
+      getsockname(conn_fd.get(), reinterpret_cast<sockaddr*>(&conn_bound_addr),
+                  &conn_addrlen),
+      SyscallSucceeds());
+
+  // close the accept FD to trigger TIME_WAIT on the accepted socket which
+  // should cause the conn_fd to follow CLOSE_WAIT->LAST_ACK->CLOSED instead of
+  // TIME_WAIT.
+  accepted.reset();
+  absl::SleepFor(absl::Seconds(1));
+  conn_fd.reset();
+  absl::SleepFor(absl::Seconds(1));
+
+  // Now bind and connect a new socket and verify that we can immediately
+  // rebind the address bound by the conn_fd as it never entered TIME_WAIT.
+  const FileDescriptor conn_fd2 = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+  ASSERT_THAT(bind(conn_fd2.get(),
+                   reinterpret_cast<sockaddr*>(&conn_bound_addr), conn_addrlen),
+              SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd2.get(),
+                                  reinterpret_cast<sockaddr*>(&conn_addr),
+                                  conn_addrlen),
+              SyscallSucceeds());
 }
 
 INSTANTIATE_TEST_SUITE_P(

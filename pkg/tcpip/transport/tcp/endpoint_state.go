@@ -165,6 +165,12 @@ func (e *endpoint) loadState(state EndpointState) {
 
 // afterLoad is invoked by stateify.
 func (e *endpoint) afterLoad() {
+	// Freeze segment queue before registering to prevent any segments
+	// from being delivered while it is being restored.
+	e.origEndpointState = e.state
+	// Restore the endpoint to InitialState as it will be moved to
+	// its origEndpointState during Resume.
+	e.state = StateInitial
 	stack.StackFromEnv.RegisterRestoredEndpoint(e)
 }
 
@@ -173,8 +179,8 @@ func (e *endpoint) Resume(s *stack.Stack) {
 	e.stack = s
 	e.segmentQueue.setLimit(MaxUnprocessedSegments)
 	e.workMu.Init()
+	state := e.origEndpointState
 
-	state := e.state
 	switch state {
 	case StateInitial, StateBound, StateListen, StateConnecting, StateEstablished:
 		var ss SendBufferSizeOption
@@ -189,7 +195,6 @@ func (e *endpoint) Resume(s *stack.Stack) {
 	}
 
 	bind := func() {
-		e.state = StateInitial
 		if len(e.BindAddr) == 0 {
 			e.BindAddr = e.ID.LocalAddress
 		}
@@ -219,6 +224,10 @@ func (e *endpoint) Resume(s *stack.Stack) {
 		if err := e.connect(tcpip.FullAddress{NIC: e.boundNICID, Addr: e.connectingAddress, Port: e.ID.RemotePort}, false, e.workerRunning); err != tcpip.ErrConnectStarted {
 			panic("endpoint connecting failed: " + err.String())
 		}
+		e.mu.Lock()
+		e.state = e.origEndpointState
+		e.mu.Unlock()
+		e.notifyProtocolGoroutine(notifyStateChanged)
 		connectedLoading.Done()
 	case StateListen:
 		tcpip.AsyncLoading.Add(1)
