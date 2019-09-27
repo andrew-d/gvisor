@@ -253,7 +253,7 @@ func (t *Task) promoteLocked() {
 
 	t.tg.leader = t
 	t.Infof("Becoming TID %d (in root PID namespace)", t.tg.pidns.owner.Root.tids[t])
-	t.updateLogPrefixLocked()
+	t.updateInfoLocked()
 	// Reap the original leader. If it has a tracer, detach it instead of
 	// waiting for it to acknowledge the original leader's death.
 	oldLeader.exitParentNotified = true

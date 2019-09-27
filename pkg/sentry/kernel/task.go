@@ -15,6 +15,8 @@
 package kernel
 
 import (
+	gocontext "context"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 
@@ -391,6 +393,11 @@ type Task struct {
 	// logPrefix is a string containing the task's thread ID in the root PID
 	// namespace, and is prepended to log messages emitted by Task.Infof etc.
 	logPrefix atomic.Value `state:".(string)"`
+
+	// traceContext and traceTask are both used for tracing, and are
+	// updated along with the logPrefix in updateInfoLocked.
+	traceContext gocontext.Context
+	traceTask    *trace.Task
 
 	// creds is the task's credentials.
 	//

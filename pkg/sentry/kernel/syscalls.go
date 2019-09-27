@@ -339,6 +339,11 @@ func (s *SyscallTable) Lookup(sysno uintptr) SyscallFn {
 	return nil
 }
 
+// LookupName looks up a syscall name.
+func (s *SyscallTable) LookupName(sysno uintptr) string {
+	return s.Table[sysno].Name // May be empty string.
+}
+
 // LookupEmulate looks up an emulation syscall number.
 func (s *SyscallTable) LookupEmulate(addr usermem.Addr) (uintptr, bool) {
 	sysno, ok := s.Emulate[addr]

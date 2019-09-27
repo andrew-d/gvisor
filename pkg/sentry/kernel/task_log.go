@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"fmt"
+	"runtime/trace"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/log"
@@ -127,11 +128,18 @@ func (t *Task) debugDumpStack() {
 	}
 }
 
-// updateLogPrefix updates the task's cached log prefix to reflect its
-// current thread ID.
+// updateInfoLocked updates the task's cached log prefix and tracing
+// information to reflect its current thread ID.
 //
 // Preconditions: The task's owning TaskSet.mu must be locked.
-func (t *Task) updateLogPrefixLocked() {
+func (t *Task) updateInfoLocked() {
 	// Use the task's TID in the root PID namespace for logging.
-	t.logPrefix.Store(fmt.Sprintf("[% 4d] ", t.tg.pidns.owner.Root.tids[t]))
+	tid := t.tg.pidns.owner.Root.tids[t]
+	t.logPrefix.Store(fmt.Sprintf("[% 4d] ", tid))
+
+	// Re-initialize the trace context.
+	if t.traceTask != nil {
+		t.traceTask.End()
+	}
+	t.traceContext, t.traceTask = trace.NewTask(t, fmt.Sprintf("tid:%d", tid))
 }

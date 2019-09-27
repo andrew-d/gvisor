@@ -52,7 +52,7 @@ build //runsc
 declare OUTPUT="$(build //runsc)"
 
 if [[ ${REFRESH} -eq 0 ]]; then
-  install_runsc "${RUNTIME}"   --net-raw
+  install_runsc "${RUNTIME}"   --net-raw --profile
   install_runsc "${RUNTIME}-d" --net-raw --debug --strace --log-packets
 
   echo

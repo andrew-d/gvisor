@@ -17,6 +17,7 @@ package kernel
 import (
 	"bytes"
 	"runtime"
+	"runtime/trace"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -205,9 +206,11 @@ func (*runApp) execute(t *Task) taskRunState {
 		t.tg.pidns.owner.mu.RUnlock()
 	}
 
+	region := trace.StartRegion(t.traceContext, "run")
 	t.accountTaskGoroutineEnter(TaskGoroutineRunningApp)
 	info, at, err := t.p.Switch(t.MemoryManager().AddressSpace(), t.Arch(), t.rseqCPU)
 	t.accountTaskGoroutineLeave(TaskGoroutineRunningApp)
+	region.End()
 
 	if clearSinglestep {
 		t.Arch().ClearSingleStep()
