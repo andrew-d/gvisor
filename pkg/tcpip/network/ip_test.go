@@ -96,16 +96,16 @@ func (t *testObject) checkValues(protocol tcpip.TransportProtocolNumber, vv buff
 // DeliverTransportPacket is called by network endpoints after parsing incoming
 // packets. This is used by the test object to verify that the results of the
 // parsing are expected.
-func (t *testObject) DeliverTransportPacket(r *stack.Route, protocol tcpip.TransportProtocolNumber, netHeader buffer.View, vv buffer.VectorisedView) {
-	t.checkValues(protocol, vv, r.RemoteAddress, r.LocalAddress)
+func (t *testObject) DeliverTransportPacket(r *stack.Route, protocol tcpip.TransportProtocolNumber, pb *buffer.PacketBuffer) {
+	t.checkValues(protocol, pb.Data, r.RemoteAddress, r.LocalAddress)
 	t.dataCalls++
 }
 
 // DeliverTransportControlPacket is called by network endpoints after parsing
 // incoming control (ICMP) packets. This is used by the test object to verify
 // that the results of the parsing are expected.
-func (t *testObject) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ stack.ControlType, extra uint32, vv buffer.VectorisedView) {
-	t.checkValues(trans, vv, remote, local)
+func (t *testObject) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ stack.ControlType, extra uint32, pb *buffer.PacketBuffer) {
+	t.checkValues(trans, pb.Data, remote, local)
 	if typ != t.typ {
 		t.t.Errorf("typ = %v, want %v", typ, t.typ)
 	}
@@ -279,7 +279,10 @@ func TestIPv4Receive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("could not find route: %v", err)
 	}
-	ep.HandlePacket(&r, view.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data: view.ToVectorisedView(),
+	}
+	ep.HandlePacket(&r, &pb)
 	if o.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", o.dataCalls)
 	}
@@ -367,7 +370,10 @@ func TestIPv4ReceiveControl(t *testing.T) {
 			o.extra = c.expectedExtra
 
 			vv := view[:len(view)-c.trunc].ToVectorisedView()
-			ep.HandlePacket(&r, vv)
+			pb := buffer.PacketBuffer{
+				Data: vv,
+			}
+			ep.HandlePacket(&r, &pb)
 			if want := c.expectedCount; o.controlCalls != want {
 				t.Fatalf("Bad number of control calls for %q case: got %v, want %v", c.name, o.controlCalls, want)
 			}
@@ -430,13 +436,19 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 	}
 
 	// Send first segment.
-	ep.HandlePacket(&r, frag1.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data: frag1.ToVectorisedView(),
+	}
+	ep.HandlePacket(&r, &pb)
 	if o.dataCalls != 0 {
 		t.Fatalf("Bad number of data calls: got %x, want 0", o.dataCalls)
 	}
 
 	// Send second segment.
-	ep.HandlePacket(&r, frag2.ToVectorisedView())
+	pb = buffer.PacketBuffer{
+		Data: frag2.ToVectorisedView(),
+	}
+	ep.HandlePacket(&r, &pb)
 	if o.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", o.dataCalls)
 	}
@@ -509,7 +521,10 @@ func TestIPv6Receive(t *testing.T) {
 		t.Fatalf("could not find route: %v", err)
 	}
 
-	ep.HandlePacket(&r, view.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data: view.ToVectorisedView(),
+	}
+	ep.HandlePacket(&r, &pb)
 	if o.dataCalls != 1 {
 		t.Fatalf("Bad number of data calls: got %x, want 1", o.dataCalls)
 	}
@@ -618,7 +633,10 @@ func TestIPv6ReceiveControl(t *testing.T) {
 			o.extra = c.expectedExtra
 
 			vv := view[:len(view)-c.trunc].ToVectorisedView()
-			ep.HandlePacket(&r, vv)
+			pb := buffer.PacketBuffer{
+				Data: vv,
+			}
+			ep.HandlePacket(&r, &pb)
 			if want := c.expectedCount; o.controlCalls != want {
 				t.Fatalf("Bad number of control calls for %q case: got %v, want %v", c.name, o.controlCalls, want)
 			}

@@ -44,12 +44,12 @@ func NewForwarder(s *stack.Stack, handler func(*ForwarderRequest)) *Forwarder {
 //
 // This function is expected to be passed as an argument to the
 // stack.SetTransportProtocolHandler function.
-func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, netHeader buffer.View, vv buffer.VectorisedView) bool {
+func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pb *buffer.PacketBuffer) bool {
 	f.handler(&ForwarderRequest{
 		stack: f.stack,
 		route: r,
 		id:    id,
-		vv:    vv,
+		pb:    pb,
 	})
 
 	return true
@@ -62,7 +62,7 @@ type ForwarderRequest struct {
 	stack *stack.Stack
 	route *stack.Route
 	id    stack.TransportEndpointID
-	vv    buffer.VectorisedView
+	pb    *buffer.PacketBuffer
 }
 
 // ID returns the 4-tuple (src address, src port, dst address, dst port) that
@@ -90,7 +90,7 @@ func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, 
 	ep.rcvReady = true
 	ep.rcvMu.Unlock()
 
-	ep.HandlePacket(r.route, r.id, r.vv)
+	ep.HandlePacket(r.route, r.id, r.pb)
 
 	return ep, nil
 }

@@ -97,7 +97,10 @@ func TestHopLimitValidation(t *testing.T) {
 			SrcAddr:       r.LocalAddress,
 			DstAddr:       r.RemoteAddress,
 		})
-		ep.HandlePacket(r, hdr.View().ToVectorisedView())
+		pb := buffer.PacketBuffer{
+			Data: hdr.View().ToVectorisedView(),
+		}
+		ep.HandlePacket(r, &pb)
 	}
 
 	types := []struct {

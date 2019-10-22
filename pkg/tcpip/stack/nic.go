@@ -717,10 +717,10 @@ func (n *NIC) leaveGroupLocked(addr tcpip.Address) *tcpip.Error {
 	return nil
 }
 
-func handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, localLinkAddr, remotelinkAddr tcpip.LinkAddress, ref *referencedNetworkEndpoint, vv buffer.VectorisedView) {
+func handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, localLinkAddr, remotelinkAddr tcpip.LinkAddress, ref *referencedNetworkEndpoint, pb *buffer.PacketBuffer) {
 	r := makeRoute(protocol, dst, src, localLinkAddr, ref, false /* handleLocal */, false /* multicastLoop */)
 	r.RemoteLinkAddress = remotelinkAddr
-	ref.ep.HandlePacket(&r, vv)
+	ref.ep.HandlePacket(&r, pb)
 	ref.decRef()
 }
 
@@ -730,9 +730,9 @@ func handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, 
 // Note that the ownership of the slice backing vv is retained by the caller.
 // This rule applies only to the slice itself, not to the items of the slice;
 // the ownership of the items is not retained by the caller.
-func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, vv buffer.VectorisedView, linkHeader buffer.View) {
+func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pb *buffer.PacketBuffer) {
 	n.stats.Rx.Packets.Increment()
-	n.stats.Rx.Bytes.IncrementBy(uint64(vv.Size()))
+	n.stats.Rx.Bytes.IncrementBy(uint64(pb.Data.Size()))
 
 	netProto, ok := n.stack.networkProtocols[protocol]
 	if !ok {
@@ -757,22 +757,22 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 	}
 	n.mu.RUnlock()
 	for _, ep := range packetEPs {
-		ep.HandlePacket(n.id, local, protocol, vv, linkHeader)
+		ep.HandlePacket(n.id, local, protocol, pb)
 	}
 
 	if netProto.Number() == header.IPv4ProtocolNumber || netProto.Number() == header.IPv6ProtocolNumber {
 		n.stack.stats.IP.PacketsReceived.Increment()
 	}
 
-	if len(vv.First()) < netProto.MinimumPacketSize() {
+	if len(pb.Data.First()) < netProto.MinimumPacketSize() {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
 
-	src, dst := netProto.ParseAddresses(vv.First())
+	src, dst := netProto.ParseAddresses(pb.Data.First())
 
 	if ref := n.getRef(protocol, dst); ref != nil {
-		handlePacket(protocol, dst, src, linkEP.LinkAddress(), remote, ref, vv)
+		handlePacket(protocol, dst, src, linkEP.LinkAddress(), remote, ref, pb)
 		return
 	}
 
@@ -800,20 +800,20 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 		if ok {
 			r.RemoteAddress = src
 			// TODO(b/123449044): Update the source NIC as well.
-			ref.ep.HandlePacket(&r, vv)
+			ref.ep.HandlePacket(&r, pb)
 			ref.decRef()
 		} else {
 			// n doesn't have a destination endpoint.
 			// Send the packet out of n.
-			hdr := buffer.NewPrependableFromView(vv.First())
-			vv.RemoveFirst()
+			hdr := buffer.NewPrependableFromView(pb.Data.First())
+			pb.Data.RemoveFirst()
 
 			// TODO(b/128629022): use route.WritePacket.
-			if err := n.linkEP.WritePacket(&r, nil /* gso */, hdr, vv, protocol); err != nil {
+			if err := n.linkEP.WritePacket(&r, nil /* gso */, hdr, pb.Data, protocol); err != nil {
 				r.Stats().IP.OutgoingPacketErrors.Increment()
 			} else {
 				n.stats.Tx.Packets.Increment()
-				n.stats.Tx.Bytes.IncrementBy(uint64(hdr.UsedLength() + vv.Size()))
+				n.stats.Tx.Bytes.IncrementBy(uint64(hdr.UsedLength() + pb.Data.Size()))
 			}
 		}
 		return
@@ -827,7 +827,7 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, netHeader buffer.View, vv buffer.VectorisedView) {
+func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pb *buffer.PacketBuffer) {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -839,41 +839,41 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// Raw socket packets are delivered based solely on the transport
 	// protocol number. We do not inspect the payload to ensure it's
 	// validly formed.
-	n.stack.demux.deliverRawPacket(r, protocol, netHeader, vv)
+	n.stack.demux.deliverRawPacket(r, protocol, pb)
 
-	if len(vv.First()) < transProto.MinimumPacketSize() {
+	if len(pb.Data.First()) < transProto.MinimumPacketSize() {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
 
-	srcPort, dstPort, err := transProto.ParsePorts(vv.First())
+	srcPort, dstPort, err := transProto.ParsePorts(pb.Data.First())
 	if err != nil {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
 
 	id := TransportEndpointID{dstPort, r.LocalAddress, srcPort, r.RemoteAddress}
-	if n.stack.demux.deliverPacket(r, protocol, netHeader, vv, id) {
+	if n.stack.demux.deliverPacket(r, protocol, pb, id) {
 		return
 	}
 
 	// Try to deliver to per-stack default handler.
 	if state.defaultHandler != nil {
-		if state.defaultHandler(r, id, netHeader, vv) {
+		if state.defaultHandler(r, id, pb) {
 			return
 		}
 	}
 
 	// We could not find an appropriate destination for this packet, so
 	// deliver it to the global handler.
-	if !transProto.HandleUnknownDestinationPacket(r, id, netHeader, vv) {
+	if !transProto.HandleUnknownDestinationPacket(r, id, pb) {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 	}
 }
 
 // DeliverTransportControlPacket delivers control packets to the appropriate
 // transport protocol endpoint.
-func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ ControlType, extra uint32, vv buffer.VectorisedView) {
+func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ ControlType, extra uint32, pb *buffer.PacketBuffer) {
 	state, ok := n.stack.transportProtocols[trans]
 	if !ok {
 		return
@@ -884,17 +884,17 @@ func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcp
 	// ICMPv4 only guarantees that 8 bytes of the transport protocol will
 	// be present in the payload. We know that the ports are within the
 	// first 8 bytes for all known transport protocols.
-	if len(vv.First()) < 8 {
+	if len(pb.Data.First()) < 8 {
 		return
 	}
 
-	srcPort, dstPort, err := transProto.ParsePorts(vv.First())
+	srcPort, dstPort, err := transProto.ParsePorts(pb.Data.First())
 	if err != nil {
 		return
 	}
 
 	id := TransportEndpointID{srcPort, local, dstPort, remote}
-	if n.stack.demux.deliverControlPacket(n, net, trans, typ, extra, vv, id) {
+	if n.stack.demux.deliverControlPacket(n, net, trans, typ, extra, pb, id) {
 		return
 	}
 }

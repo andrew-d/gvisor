@@ -65,7 +65,7 @@ type stubDispatcher struct {
 	stack.TransportDispatcher
 }
 
-func (*stubDispatcher) DeliverTransportPacket(*stack.Route, tcpip.TransportProtocolNumber, buffer.View, buffer.VectorisedView) {
+func (*stubDispatcher) DeliverTransportPacket(*stack.Route, tcpip.TransportProtocolNumber, *buffer.PacketBuffer) {
 }
 
 type stubLinkAddressCache struct {
@@ -147,7 +147,10 @@ func TestICMPCounts(t *testing.T) {
 			SrcAddr:       r.LocalAddress,
 			DstAddr:       r.RemoteAddress,
 		})
-		ep.HandlePacket(&r, hdr.View().ToVectorisedView())
+		pb := buffer.PacketBuffer{
+			Data: hdr.View().ToVectorisedView(),
+		}
+		ep.HandlePacket(&r, &pb)
 	}
 
 	for _, typ := range types {
@@ -280,7 +283,10 @@ func routeICMPv6Packet(t *testing.T, args routeArgs, fn func(*testing.T, header.
 		views := []buffer.View{pkt.Header, pkt.Payload}
 		size := len(pkt.Header) + len(pkt.Payload)
 		vv := buffer.NewVectorisedView(size, views)
-		args.dst.InjectLinkAddr(pkt.Proto, args.dst.LinkAddress(), vv)
+		pb := buffer.PacketBuffer{
+			Data: vv,
+		}
+		args.dst.InjectLinkAddr(pkt.Proto, args.dst.LinkAddress(), &pb)
 	}
 
 	if pkt.Proto != ProtocolNumber {

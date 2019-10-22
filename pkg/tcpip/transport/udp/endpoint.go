@@ -1154,17 +1154,17 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv buffer.VectorisedView) {
+func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pb *buffer.PacketBuffer) {
 	// Get the header then trim it from the view.
-	hdr := header.UDP(vv.First())
-	if int(hdr.Length()) > vv.Size() {
+	hdr := header.UDP(pb.Data.First())
+	if int(hdr.Length()) > pb.Data.Size() {
 		// Malformed packet.
 		e.stack.Stats().UDP.MalformedPacketsReceived.Increment()
 		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
 	}
 
-	vv.TrimFront(header.UDPMinimumSize)
+	pb.Data.TrimFront(header.UDPMinimumSize)
 
 	e.rcvMu.Lock()
 	e.stack.Stats().UDP.PacketsReceived.Increment()
@@ -1195,9 +1195,9 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv
 			Port: hdr.SourcePort(),
 		},
 	}
-	pkt.data = vv.Clone(pkt.views[:])
+	pkt.data = pb.Data.Clone(pkt.views[:])
 	e.rcvList.PushBack(pkt)
-	e.rcvBufSize += vv.Size()
+	e.rcvBufSize += pb.Data.Size()
 
 	pkt.timestamp = e.stack.NowNanoseconds()
 
@@ -1210,7 +1210,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv
 }
 
 // HandleControlPacket implements stack.TransportEndpoint.HandleControlPacket.
-func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.ControlType, extra uint32, vv buffer.VectorisedView) {
+func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.ControlType, extra uint32, pb *buffer.PacketBuffer) {
 }
 
 // State implements tcpip.Endpoint.State.

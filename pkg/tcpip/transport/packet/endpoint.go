@@ -270,7 +270,7 @@ func (ep *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 }
 
 // HandlePacket implements stack.PacketEndpoint.HandlePacket.
-func (ep *endpoint) HandlePacket(nicid tcpip.NICID, localAddr tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, vv buffer.VectorisedView, ethHeader buffer.View) {
+func (ep *endpoint) HandlePacket(nicid tcpip.NICID, localAddr tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, pb *buffer.PacketBuffer) {
 	ep.rcvMu.Lock()
 
 	// Drop the packet if our buffer is currently full.
@@ -293,9 +293,9 @@ func (ep *endpoint) HandlePacket(nicid tcpip.NICID, localAddr tcpip.LinkAddress,
 	// Push new packet into receive list and increment the buffer size.
 	var packet packet
 	// TODO(b/129292371): Return network protocol.
-	if len(ethHeader) > 0 {
+	if len(pb.LinkHeader) > 0 {
 		// Get info directly from the ethernet header.
-		hdr := header.Ethernet(ethHeader)
+		hdr := header.Ethernet(pb.LinkHeader)
 		packet.senderAddr = tcpip.FullAddress{
 			NIC:  nicid,
 			Addr: tcpip.Address(hdr.SourceAddress()),
@@ -310,11 +310,12 @@ func (ep *endpoint) HandlePacket(nicid tcpip.NICID, localAddr tcpip.LinkAddress,
 
 	if ep.cooked {
 		// Cooked packets can simply be queued.
-		packet.data = vv.Clone(packet.views[:])
+		packet.data = pb.Data.Clone(packet.views[:])
 	} else {
 		// Raw packets need their ethernet headers prepended before
 		// queueing.
-		if len(ethHeader) == 0 {
+		var linkHeader buffer.View
+		if len(pb.LinkHeader) == 0 {
 			// We weren't provided with an actual ethernet header,
 			// so fake one.
 			ethFields := header.EthernetFields{
@@ -324,10 +325,13 @@ func (ep *endpoint) HandlePacket(nicid tcpip.NICID, localAddr tcpip.LinkAddress,
 			}
 			fakeHeader := make(header.Ethernet, header.EthernetMinimumSize)
 			fakeHeader.Encode(&ethFields)
-			ethHeader = buffer.View(fakeHeader)
+			linkHeader = buffer.View(fakeHeader)
+		} else {
+			linkHeader = make(buffer.View, len(pb.LinkHeader))
+			copy(linkHeader, pb.LinkHeader)
 		}
-		combinedVV := buffer.View(ethHeader).ToVectorisedView()
-		combinedVV.Append(vv)
+		combinedVV := linkHeader.ToVectorisedView()
+		combinedVV.Append(pb.Data)
 		packet.data = combinedVV.Clone(packet.views[:])
 	}
 	packet.timestampNS = ep.stack.NowNanoseconds()

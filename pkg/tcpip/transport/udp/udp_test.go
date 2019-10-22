@@ -397,7 +397,8 @@ func (c *testContext) injectPacket(flow testFlow, payload []byte) {
 func (c *testContext) injectV6Packet(payload []byte, h *header4Tuple, valid bool) {
 	// Allocate a buffer for data and headers.
 	buf := buffer.NewView(header.UDPMinimumSize + header.IPv6MinimumSize + len(payload))
-	copy(buf[len(buf)-len(payload):], payload)
+	payloadStart := len(buf) - len(payload)
+	copy(buf[payloadStart:], payload)
 
 	// Initialize the IP header.
 	ip := header.IPv6(buf)
@@ -431,7 +432,12 @@ func (c *testContext) injectV6Packet(payload []byte, h *header4Tuple, valid bool
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
-	c.linkEP.Inject(ipv6.ProtocolNumber, buf.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data:            buf.ToVectorisedView(),
+		NetworkHeader:   buffer.View(ip),
+		TransportHeader: buffer.View(u),
+	}
+	c.linkEP.InjectInbound(ipv6.ProtocolNumber, &pb)
 }
 
 // injectV4Packet creates a V4 test packet with the given payload and header
@@ -441,7 +447,8 @@ func (c *testContext) injectV6Packet(payload []byte, h *header4Tuple, valid bool
 func (c *testContext) injectV4Packet(payload []byte, h *header4Tuple, valid bool) {
 	// Allocate a buffer for data and headers.
 	buf := buffer.NewView(header.UDPMinimumSize + header.IPv4MinimumSize + len(payload))
-	copy(buf[len(buf)-len(payload):], payload)
+	payloadStart := len(buf) - len(payload)
+	copy(buf[payloadStart:], payload)
 
 	// Initialize the IP header.
 	ip := header.IPv4(buf)
@@ -471,7 +478,13 @@ func (c *testContext) injectV4Packet(payload []byte, h *header4Tuple, valid bool
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
-	c.linkEP.Inject(ipv4.ProtocolNumber, buf.ToVectorisedView())
+
+	pb := buffer.PacketBuffer{
+		Data:            buf.ToVectorisedView(),
+		NetworkHeader:   buffer.View(ip),
+		TransportHeader: buffer.View(u),
+	}
+	c.linkEP.InjectInbound(ipv4.ProtocolNumber, &pb)
 }
 
 func newPayload() []byte {

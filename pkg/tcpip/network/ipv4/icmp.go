@@ -24,8 +24,8 @@ import (
 // the original packet that caused the ICMP one to be sent. This information is
 // used to find out which transport endpoint must be notified about the ICMP
 // packet.
-func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, vv buffer.VectorisedView) {
-	h := header.IPv4(vv.First())
+func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pb *buffer.PacketBuffer) {
+	h := header.IPv4(pb.Data.First())
 
 	// We don't use IsValid() here because ICMP only requires that the IP
 	// header plus 8 bytes of the transport header be included. So it's
@@ -39,7 +39,7 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, vv buffer.
 	}
 
 	hlen := int(h.HeaderLength())
-	if vv.Size() < hlen || h.FragmentOffset() != 0 {
+	if pb.Data.Size() < hlen || h.FragmentOffset() != 0 {
 		// We won't be able to handle this if it doesn't contain the
 		// full IPv4 header, or if it's a fragment not at offset 0
 		// (because it won't have the transport header).
@@ -47,15 +47,15 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, vv buffer.
 	}
 
 	// Skip the ip header, then deliver control message.
-	vv.TrimFront(hlen)
+	pb.Data.TrimFront(hlen)
 	p := h.TransportProtocol()
-	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, h.DestinationAddress(), ProtocolNumber, p, typ, extra, vv)
+	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, h.DestinationAddress(), ProtocolNumber, p, typ, extra, pb)
 }
 
-func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.VectorisedView) {
+func (e *endpoint) handleICMP(r *stack.Route, pb *buffer.PacketBuffer) {
 	stats := r.Stats()
 	received := stats.ICMP.V4PacketsReceived
-	v := vv.First()
+	v := pb.Data.First()
 	if len(v) < header.ICMPv4MinimumSize {
 		received.Invalid.Increment()
 		return
@@ -73,20 +73,26 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.V
 		// checksum. We'll have to reset this before we hand the packet
 		// off.
 		h.SetChecksum(0)
-		gotChecksum := ^header.ChecksumVV(vv, 0 /* initial */)
+		gotChecksum := ^header.ChecksumVV(pb.Data, 0 /* initial */)
 		if gotChecksum != wantChecksum {
 			// It's possible that a raw socket expects to receive this.
 			h.SetChecksum(wantChecksum)
-			e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, netHeader, vv)
+			e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, pb)
 			received.Invalid.Increment()
 			return
 		}
 
 		// It's possible that a raw socket expects to receive this.
 		h.SetChecksum(wantChecksum)
-		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, netHeader, vv)
+		networkHeader := make(buffer.View, len(pb.NetworkHeader))
+		copy(networkHeader, pb.NetworkHeader)
+		npb := buffer.PacketBuffer{
+			Data:          pb.Data.Clone(nil),
+			NetworkHeader: networkHeader,
+		}
+		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, &npb)
 
-		vv := vv.Clone(nil)
+		vv := pb.Data.Clone(nil)
 		vv.TrimFront(header.ICMPv4MinimumSize)
 		hdr := buffer.NewPrependable(int(r.MaxHeaderLength()) + header.ICMPv4MinimumSize)
 		pkt := header.ICMPv4(hdr.Prepend(header.ICMPv4MinimumSize))
@@ -104,19 +110,19 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.V
 	case header.ICMPv4EchoReply:
 		received.EchoReply.Increment()
 
-		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, netHeader, vv)
+		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, pb)
 
 	case header.ICMPv4DstUnreachable:
 		received.DstUnreachable.Increment()
 
-		vv.TrimFront(header.ICMPv4MinimumSize)
+		pb.Data.TrimFront(header.ICMPv4MinimumSize)
 		switch h.Code() {
 		case header.ICMPv4PortUnreachable:
-			e.handleControl(stack.ControlPortUnreachable, 0, vv)
+			e.handleControl(stack.ControlPortUnreachable, 0, pb)
 
 		case header.ICMPv4FragmentationNeeded:
 			mtu := uint32(h.MTU())
-			e.handleControl(stack.ControlPacketTooBig, calculateMTU(mtu), vv)
+			e.handleControl(stack.ControlPacketTooBig, calculateMTU(mtu), pb)
 		}
 
 	case header.ICMPv4SrcQuench:

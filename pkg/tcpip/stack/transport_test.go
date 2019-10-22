@@ -192,7 +192,7 @@ func (*fakeTransportEndpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Erro
 	return tcpip.FullAddress{}, nil
 }
 
-func (f *fakeTransportEndpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, _ buffer.VectorisedView) {
+func (f *fakeTransportEndpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, _ *buffer.PacketBuffer) {
 	// Increment the number of received packets.
 	f.proto.packetCount++
 	if f.acceptQueue != nil {
@@ -209,7 +209,7 @@ func (f *fakeTransportEndpoint) HandlePacket(r *stack.Route, id stack.TransportE
 	}
 }
 
-func (f *fakeTransportEndpoint) HandleControlPacket(stack.TransportEndpointID, stack.ControlType, uint32, buffer.VectorisedView) {
+func (f *fakeTransportEndpoint) HandleControlPacket(stack.TransportEndpointID, stack.ControlType, uint32, *buffer.PacketBuffer) {
 	// Increment the number of received control packets.
 	f.proto.controlCount++
 }
@@ -266,7 +266,7 @@ func (*fakeTransportProtocol) ParsePorts(buffer.View) (src, dst uint16, err *tcp
 	return 0, 0, nil
 }
 
-func (*fakeTransportProtocol) HandleUnknownDestinationPacket(*stack.Route, stack.TransportEndpointID, buffer.View, buffer.VectorisedView) bool {
+func (*fakeTransportProtocol) HandleUnknownDestinationPacket(*stack.Route, stack.TransportEndpointID, *buffer.PacketBuffer) bool {
 	return true
 }
 
@@ -337,7 +337,10 @@ func TestTransportReceive(t *testing.T) {
 	// Make sure packet with wrong protocol is not delivered.
 	buf[0] = 1
 	buf[2] = 0
-	linkEP.Inject(fakeNetNumber, buf.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data: buf.ToVectorisedView(),
+	}
+	linkEP.InjectInbound(fakeNetNumber, &pb)
 	if fakeTrans.packetCount != 0 {
 		t.Errorf("packetCount = %d, want %d", fakeTrans.packetCount, 0)
 	}
@@ -346,7 +349,10 @@ func TestTransportReceive(t *testing.T) {
 	buf[0] = 1
 	buf[1] = 3
 	buf[2] = byte(fakeTransNumber)
-	linkEP.Inject(fakeNetNumber, buf.ToVectorisedView())
+	pb = buffer.PacketBuffer{
+		Data: buf.ToVectorisedView(),
+	}
+	linkEP.InjectInbound(fakeNetNumber, &pb)
 	if fakeTrans.packetCount != 0 {
 		t.Errorf("packetCount = %d, want %d", fakeTrans.packetCount, 0)
 	}
@@ -355,7 +361,10 @@ func TestTransportReceive(t *testing.T) {
 	buf[0] = 1
 	buf[1] = 2
 	buf[2] = byte(fakeTransNumber)
-	linkEP.Inject(fakeNetNumber, buf.ToVectorisedView())
+	pb = buffer.PacketBuffer{
+		Data: buf.ToVectorisedView(),
+	}
+	linkEP.InjectInbound(fakeNetNumber, &pb)
 	if fakeTrans.packetCount != 1 {
 		t.Errorf("packetCount = %d, want %d", fakeTrans.packetCount, 1)
 	}
@@ -408,7 +417,10 @@ func TestTransportControlReceive(t *testing.T) {
 	buf[fakeNetHeaderLen+0] = 0
 	buf[fakeNetHeaderLen+1] = 1
 	buf[fakeNetHeaderLen+2] = 0
-	linkEP.Inject(fakeNetNumber, buf.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data: buf.ToVectorisedView(),
+	}
+	linkEP.InjectInbound(fakeNetNumber, &pb)
 	if fakeTrans.controlCount != 0 {
 		t.Errorf("controlCount = %d, want %d", fakeTrans.controlCount, 0)
 	}
@@ -417,7 +429,10 @@ func TestTransportControlReceive(t *testing.T) {
 	buf[fakeNetHeaderLen+0] = 3
 	buf[fakeNetHeaderLen+1] = 1
 	buf[fakeNetHeaderLen+2] = byte(fakeTransNumber)
-	linkEP.Inject(fakeNetNumber, buf.ToVectorisedView())
+	pb = buffer.PacketBuffer{
+		Data: buf.ToVectorisedView(),
+	}
+	linkEP.InjectInbound(fakeNetNumber, &pb)
 	if fakeTrans.controlCount != 0 {
 		t.Errorf("controlCount = %d, want %d", fakeTrans.controlCount, 0)
 	}
@@ -426,7 +441,10 @@ func TestTransportControlReceive(t *testing.T) {
 	buf[fakeNetHeaderLen+0] = 2
 	buf[fakeNetHeaderLen+1] = 1
 	buf[fakeNetHeaderLen+2] = byte(fakeTransNumber)
-	linkEP.Inject(fakeNetNumber, buf.ToVectorisedView())
+	pb = buffer.PacketBuffer{
+		Data: buf.ToVectorisedView(),
+	}
+	linkEP.InjectInbound(fakeNetNumber, &pb)
 	if fakeTrans.controlCount != 1 {
 		t.Errorf("controlCount = %d, want %d", fakeTrans.controlCount, 1)
 	}
@@ -579,7 +597,10 @@ func TestTransportForwarding(t *testing.T) {
 	req[0] = 1
 	req[1] = 3
 	req[2] = byte(fakeTransNumber)
-	ep2.Inject(fakeNetNumber, req.ToVectorisedView())
+	pb := buffer.PacketBuffer{
+		Data: req.ToVectorisedView(),
+	}
+	ep2.InjectInbound(fakeNetNumber, &pb)
 
 	aep, _, err := ep.Accept()
 	if err != nil || aep == nil {

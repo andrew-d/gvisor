@@ -66,10 +66,10 @@ func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error) {
 
 // HandleUnknownDestinationPacket handles packets targeted at this protocol but
 // that don't match any existing endpoint.
-func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, netHeader buffer.View, vv buffer.VectorisedView) bool {
+func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pb *buffer.PacketBuffer) bool {
 	// Get the header then trim it from the view.
-	hdr := header.UDP(vv.First())
-	if int(hdr.Length()) > vv.Size() {
+	hdr := header.UDP(pb.Data.First())
+	if int(hdr.Length()) > pb.Data.Size() {
 		// Malformed packet.
 		r.Stack().Stats().UDP.MalformedPacketsReceived.Increment()
 		return true
@@ -116,20 +116,19 @@ func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.Trans
 		}
 		headerLen := int(r.MaxHeaderLength()) + header.ICMPv4MinimumSize
 		available := int(mtu) - headerLen
-		payloadLen := len(netHeader) + vv.Size()
+		payloadLen := len(pb.NetworkHeader) + pb.Data.Size()
 		if payloadLen > available {
 			payloadLen = available
 		}
 
-		// The buffers used by vv and netHeader may be used elsewhere
-		// in the system.  For example, a raw or packet socket may use
-		// what UDP considers an unreachable destination. Thus we deep
-		// copy vv and netHeader to prevent multiple ownership and SR
-		// errors.
-		newNetHeader := make(buffer.View, len(netHeader))
-		copy(newNetHeader, netHeader)
+		// The buffers used by pb may be used elsewhere in the system.
+		// For example, a raw or packet socket may use what UDP
+		// considers an unreachable destination. Thus we deep copy pb
+		// to prevent multiple ownership and SR errors.
+		newNetHeader := make(buffer.View, len(pb.NetworkHeader))
+		copy(newNetHeader, pb.NetworkHeader)
 		payload := buffer.NewVectorisedView(len(newNetHeader), []buffer.View{newNetHeader})
-		payload.Append(vv.ToView().ToVectorisedView())
+		payload.Append(pb.Data.ToView().ToVectorisedView())
 		payload.CapLength(payloadLen)
 
 		hdr := buffer.NewPrependable(headerLen)
@@ -158,12 +157,12 @@ func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.Trans
 		}
 		headerLen := int(r.MaxHeaderLength()) + header.ICMPv6DstUnreachableMinimumSize
 		available := int(mtu) - headerLen
-		payloadLen := len(netHeader) + vv.Size()
+		payloadLen := len(pb.NetworkHeader) + pb.Data.Size()
 		if payloadLen > available {
 			payloadLen = available
 		}
-		payload := buffer.NewVectorisedView(len(netHeader), []buffer.View{netHeader})
-		payload.Append(vv)
+		payload := buffer.NewVectorisedView(len(pb.NetworkHeader), []buffer.View{pb.NetworkHeader})
+		payload.Append(pb.Data)
 		payload.CapLength(payloadLen)
 
 		hdr := buffer.NewPrependable(headerLen)

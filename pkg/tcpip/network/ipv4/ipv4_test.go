@@ -464,7 +464,10 @@ func TestInvalidFragments(t *testing.T) {
 			s.CreateNIC(nicid, sniffer.New(ep))
 
 			for _, pkt := range tc.packets {
-				ep.InjectLinkAddr(header.IPv4ProtocolNumber, remoteLinkAddr, buffer.NewVectorisedView(len(pkt), []buffer.View{pkt}))
+				pb := buffer.PacketBuffer{
+					Data: buffer.NewVectorisedView(len(pkt), []buffer.View{pkt}),
+				}
+				ep.InjectLinkAddr(header.IPv4ProtocolNumber, remoteLinkAddr, &pb)
 			}
 
 			if got, want := s.Stats().IP.MalformedPacketsReceived.Value(), tc.wantMalformedIPPackets; got != want {

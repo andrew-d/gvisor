@@ -559,7 +559,7 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 }
 
 // HandlePacket implements stack.RawTransportEndpoint.HandlePacket.
-func (e *endpoint) HandlePacket(route *stack.Route, netHeader buffer.View, vv buffer.VectorisedView) {
+func (e *endpoint) HandlePacket(route *stack.Route, pb *buffer.PacketBuffer) {
 	e.rcvMu.Lock()
 
 	// Drop the packet if our buffer is currently full.
@@ -607,8 +607,10 @@ func (e *endpoint) HandlePacket(route *stack.Route, netHeader buffer.View, vv bu
 		},
 	}
 
-	combinedVV := netHeader.ToVectorisedView()
-	combinedVV.Append(vv)
+	networkHeader := make(buffer.View, len(pb.NetworkHeader))
+	copy(networkHeader, pb.NetworkHeader)
+	combinedVV := networkHeader.ToVectorisedView()
+	combinedVV.Append(pb.Data)
 	pkt.data = combinedVV.Clone(pkt.views[:])
 	pkt.timestampNS = e.stack.NowNanoseconds()
 

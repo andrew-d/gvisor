@@ -25,8 +25,8 @@ import (
 // the original packet that caused the ICMP one to be sent. This information is
 // used to find out which transport endpoint must be notified about the ICMP
 // packet.
-func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, vv buffer.VectorisedView) {
-	h := header.IPv6(vv.First())
+func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pb *buffer.PacketBuffer) {
+	h := header.IPv6(pb.Data.First())
 
 	// We don't use IsValid() here because ICMP only requires that up to
 	// 1280 bytes of the original packet be included. So it's likely that it
@@ -40,10 +40,10 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, vv buffer.
 
 	// Skip the IP header, then handle the fragmentation header if there
 	// is one.
-	vv.TrimFront(header.IPv6MinimumSize)
+	pb.Data.TrimFront(header.IPv6MinimumSize)
 	p := h.TransportProtocol()
 	if p == header.IPv6FragmentHeader {
-		f := header.IPv6Fragment(vv.First())
+		f := header.IPv6Fragment(pb.Data.First())
 		if !f.IsValid() || f.FragmentOffset() != 0 {
 			// We can't handle fragments that aren't at offset 0
 			// because they don't have the transport headers.
@@ -52,19 +52,19 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, vv buffer.
 
 		// Skip fragmentation header and find out the actual protocol
 		// number.
-		vv.TrimFront(header.IPv6FragmentHeaderSize)
+		pb.Data.TrimFront(header.IPv6FragmentHeaderSize)
 		p = f.TransportProtocol()
 	}
 
 	// Deliver the control packet to the transport endpoint.
-	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, h.DestinationAddress(), ProtocolNumber, p, typ, extra, vv)
+	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, h.DestinationAddress(), ProtocolNumber, p, typ, extra, pb)
 }
 
-func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.VectorisedView) {
+func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pb *buffer.PacketBuffer) {
 	stats := r.Stats().ICMP
 	sent := stats.V6PacketsSent
 	received := stats.V6PacketsReceived
-	v := vv.First()
+	v := pb.Data.First()
 	if len(v) < header.ICMPv6MinimumSize {
 		received.Invalid.Increment()
 		return
@@ -95,9 +95,9 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.V
 			received.Invalid.Increment()
 			return
 		}
-		vv.TrimFront(header.ICMPv6PacketTooBigMinimumSize)
+		pb.Data.TrimFront(header.ICMPv6PacketTooBigMinimumSize)
 		mtu := h.MTU()
-		e.handleControl(stack.ControlPacketTooBig, calculateMTU(mtu), vv)
+		e.handleControl(stack.ControlPacketTooBig, calculateMTU(mtu), pb)
 
 	case header.ICMPv6DstUnreachable:
 		received.DstUnreachable.Increment()
@@ -105,10 +105,10 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.V
 			received.Invalid.Increment()
 			return
 		}
-		vv.TrimFront(header.ICMPv6DstUnreachableMinimumSize)
+		pb.Data.TrimFront(header.ICMPv6DstUnreachableMinimumSize)
 		switch h.Code() {
 		case header.ICMPv6PortUnreachable:
-			e.handleControl(stack.ControlPortUnreachable, 0, vv)
+			e.handleControl(stack.ControlPortUnreachable, 0, pb)
 		}
 
 	case header.ICMPv6NeighborSolicit:
@@ -267,13 +267,13 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.V
 			received.Invalid.Increment()
 			return
 		}
-		vv.TrimFront(header.ICMPv6EchoMinimumSize)
+		pb.Data.TrimFront(header.ICMPv6EchoMinimumSize)
 		hdr := buffer.NewPrependable(int(r.MaxHeaderLength()) + header.ICMPv6EchoMinimumSize)
 		pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6EchoMinimumSize))
 		copy(pkt, h)
 		pkt.SetType(header.ICMPv6EchoReply)
-		pkt.SetChecksum(header.ICMPv6Checksum(pkt, r.LocalAddress, r.RemoteAddress, vv))
-		if err := r.WritePacket(nil /* gso */, hdr, vv, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: r.DefaultTTL(), TOS: stack.DefaultTOS}); err != nil {
+		pkt.SetChecksum(header.ICMPv6Checksum(pkt, r.LocalAddress, r.RemoteAddress, pb.Data))
+		if err := r.WritePacket(nil /* gso */, hdr, pb.Data, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: r.DefaultTTL(), TOS: stack.DefaultTOS}); err != nil {
 			sent.Dropped.Increment()
 			return
 		}
@@ -285,7 +285,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, vv buffer.V
 			received.Invalid.Increment()
 			return
 		}
-		e.dispatcher.DeliverTransportPacket(r, header.ICMPv6ProtocolNumber, netHeader, vv)
+		e.dispatcher.DeliverTransportPacket(r, header.ICMPv6ProtocolNumber, pb)
 
 	case header.ICMPv6TimeExceeded:
 		received.TimeExceeded.Increment()
