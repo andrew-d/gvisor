@@ -183,6 +183,16 @@ const (
 	X86FeatureAVX512VBMI
 	X86FeatureUMIP
 	X86FeaturePKU
+	X86FeatureOSPKE
+	X86FeatureWAITPKG
+	// ecx bits 6 and 7 are reserved
+	_
+	_
+	X86FeatureGFNI
+	// ecx bits 9 and 10 are reserved
+	_
+	_
+	X86FeatureAVX512VNNI
 )
 
 // Block 4 constants are for xsave capabilities in CPUID.(EAX=0DH,ECX=01H):EAX.
