@@ -15,6 +15,9 @@
 package stack_test
 
 import (
+	"encoding/binary"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -29,11 +32,48 @@ import (
 )
 
 const (
-	addr1     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-	addr2     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
-	addr3     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03"
-	linkAddr1 = "\x02\x02\x03\x04\x05\x06"
+	addr1          = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+	addr2          = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	addr3          = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03"
+	linkAddr1      = "\x02\x02\x03\x04\x05\x06"
+	linkAddr2      = "\x02\x02\x03\x04\x05\x07"
+	linkAddr3      = "\x02\x02\x03\x04\x05\x08"
+	defaultTimeout = 250 * time.Millisecond
 )
+
+var (
+	llAddr1 = header.LinkLocalAddr(linkAddr1)
+	llAddr2 = header.LinkLocalAddr(linkAddr2)
+	llAddr3 = header.LinkLocalAddr(linkAddr3)
+)
+
+// prefixSubnetAddr returns a prefix (Address + Length), the prefix's equivalent
+// tcpip.Subnet, and an address where the lower half of the address is composed
+// of the EUI-64 of linkAddr if it is a valid unicast ethernet address.
+func prefixSubnetAddr(offset uint8, linkAddr tcpip.LinkAddress) (tcpip.AddressWithPrefix, tcpip.Subnet, tcpip.AddressWithPrefix) {
+	prefixBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8 + offset, 0, 0, 0, 0, 0, 0, 0, 0}
+	prefix := tcpip.AddressWithPrefix{
+		Address:   tcpip.Address(prefixBytes),
+		PrefixLen: 64,
+	}
+
+	[]byte(prefix.Address)[7] += offset
+
+	subnet := prefix.Subnet()
+
+	var addr tcpip.AddressWithPrefix
+	if header.IsValidUnicastEthernetAddress(linkAddr) {
+		addrBytes := make([]byte, header.IPv6AddressSize)
+		copy(addrBytes[:8], subnet.ID()[:8])
+		header.EthernetAdddressToEUI64IntoBuf(linkAddr, addrBytes[8:])
+		addr = tcpip.AddressWithPrefix{
+			Address:   tcpip.Address(addrBytes),
+			PrefixLen: 64,
+		}
+	}
+
+	return prefix, subnet, addr
+}
 
 // TestDADDisabled tests that an address successfully resolves immediately
 // when DAD is not enabled (the default for an empty stack.Options).
@@ -77,23 +117,175 @@ type ndpDADEvent struct {
 	err      *tcpip.Error
 }
 
+type ndpRouterEvent struct {
+	nicid tcpip.NICID
+	addr  tcpip.Address
+	// true if router was discovereted, false if invalidated.
+	discovered bool
+}
+
+type ndpPrefixEvent struct {
+	nicid  tcpip.NICID
+	prefix tcpip.Subnet
+	// true if prefix was discovereted, false if invalidated.
+	discovered bool
+}
+
+type ndpAutoGenAddrEventType int
+
+const (
+	newAddr ndpAutoGenAddrEventType = iota
+	invalidatedAddr
+)
+
+type ndpAutoGenAddrEvent struct {
+	nicid     tcpip.NICID
+	addr      tcpip.AddressWithPrefix
+	eventType ndpAutoGenAddrEventType
+}
+
 var _ stack.NDPDispatcher = (*ndpDispatcher)(nil)
 
 // ndpDispatcher implements NDPDispatcher so tests can know when various NDP
 // related events happen for test purposes.
 type ndpDispatcher struct {
-	dadC chan ndpDADEvent
+	dadC           chan ndpDADEvent
+	routerC        chan ndpRouterEvent
+	rememberRouter bool
+	prefixC        chan ndpPrefixEvent
+	rememberPrefix bool
+	autoGenAddrC   chan ndpAutoGenAddrEvent
+	routeTable     []tcpip.Route
 }
 
 // Implements stack.NDPDispatcher.OnDuplicateAddressDetectionStatus.
-//
-// If the DAD event matches what we are expecting, send signal on n.dadC.
 func (n *ndpDispatcher) OnDuplicateAddressDetectionStatus(nicid tcpip.NICID, addr tcpip.Address, resolved bool, err *tcpip.Error) {
-	n.dadC <- ndpDADEvent{
-		nicid,
-		addr,
-		resolved,
-		err,
+	if n.dadC != nil {
+		n.dadC <- ndpDADEvent{
+			nicid,
+			addr,
+			resolved,
+			err,
+		}
+	}
+}
+
+// Implements stack.NDPDispatcher.OnDefaultRouterDiscovered.
+func (n *ndpDispatcher) OnDefaultRouterDiscovered(nicid tcpip.NICID, addr tcpip.Address) (bool, []tcpip.Route) {
+	if n.routerC != nil {
+		n.routerC <- ndpRouterEvent{
+			nicid,
+			addr,
+			true,
+		}
+	}
+
+	if !n.rememberRouter {
+		return false, nil
+	}
+
+	rt := append([]tcpip.Route(nil), n.routeTable...)
+	rt = append(rt, tcpip.Route{
+		Destination: header.IPv6EmptySubnet,
+		Gateway:     addr,
+		NIC:         nicid,
+	})
+	n.routeTable = rt
+	return true, rt
+}
+
+// Implements stack.NDPDispatcher.OnDefaultRouterInvalidated.
+func (n *ndpDispatcher) OnDefaultRouterInvalidated(nicid tcpip.NICID, addr tcpip.Address) []tcpip.Route {
+	if n.routerC != nil {
+		n.routerC <- ndpRouterEvent{
+			nicid,
+			addr,
+			false,
+		}
+	}
+
+	rt := make([]tcpip.Route, 0)
+	exclude := tcpip.Route{
+		Destination: header.IPv6EmptySubnet,
+		Gateway:     addr,
+		NIC:         nicid,
+	}
+
+	for _, r := range n.routeTable {
+		if r != exclude {
+			rt = append(rt, r)
+		}
+	}
+	n.routeTable = rt
+	return rt
+}
+
+// Implements stack.NDPDispatcher.OnOnLinkPrefixDiscovered.
+func (n *ndpDispatcher) OnOnLinkPrefixDiscovered(nicid tcpip.NICID, prefix tcpip.Subnet) (bool, []tcpip.Route) {
+	if n.prefixC != nil {
+		n.prefixC <- ndpPrefixEvent{
+			nicid,
+			prefix,
+			true,
+		}
+	}
+
+	if !n.rememberPrefix {
+		return false, nil
+	}
+
+	rt := append([]tcpip.Route(nil), n.routeTable...)
+	rt = append(rt, tcpip.Route{
+		Destination: prefix,
+		NIC:         nicid,
+	})
+	n.routeTable = rt
+	return true, rt
+}
+
+// Implements stack.NDPDispatcher.OnOnLinkPrefixInvalidated.
+func (n *ndpDispatcher) OnOnLinkPrefixInvalidated(nicid tcpip.NICID, prefix tcpip.Subnet) []tcpip.Route {
+	if n.prefixC != nil {
+		n.prefixC <- ndpPrefixEvent{
+			nicid,
+			prefix,
+			false,
+		}
+	}
+
+	rt := make([]tcpip.Route, 0)
+	exclude := tcpip.Route{
+		Destination: prefix,
+		NIC:         nicid,
+	}
+
+	for _, r := range n.routeTable {
+		if r != exclude {
+			rt = append(rt, r)
+		}
+	}
+	n.routeTable = rt
+	return rt
+}
+
+func (n *ndpDispatcher) OnAutoGenAddress(nicid tcpip.NICID, addr tcpip.AddressWithPrefix) bool {
+	if n.autoGenAddrC != nil {
+		n.autoGenAddrC <- ndpAutoGenAddrEvent{
+			nicid,
+			addr,
+			newAddr,
+		}
+	}
+	return true
+}
+
+func (n *ndpDispatcher) OnAutoGenAddressInvalidated(nicid tcpip.NICID, addr tcpip.AddressWithPrefix) {
+	if n.autoGenAddrC != nil {
+		n.autoGenAddrC <- ndpAutoGenAddrEvent{
+			nicid,
+			addr,
+			invalidatedAddr,
+		}
 	}
 }
 
@@ -118,6 +310,8 @@ func TestDADResolve(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
 			ndpDisp := ndpDispatcher{
 				dadC: make(chan ndpDADEvent),
 			}
@@ -605,5 +799,1129 @@ func TestSetNDPConfigurations(t *testing.T) {
 				t.Fatalf("got stack.GetMainNICAddress(1, _) = %s, want = %s", addr, addr1)
 			}
 		})
+	}
+}
+
+// raBufWithOpts returns a valid NDP Router Advertisement with options.
+//
+// Note, raBufWithOpts does not populate any of the RA fields other than the
+// Router Lifetime.
+func raBufWithOpts(ip tcpip.Address, rl uint16, optSer header.NDPOptionsSerializer) buffer.Prependable {
+	icmpSize := header.ICMPv6HeaderSize + header.NDPRAMinimumSize + int(optSer.Length())
+	hdr := buffer.NewPrependable(header.IPv6MinimumSize + icmpSize)
+	pkt := header.ICMPv6(hdr.Prepend(icmpSize))
+	pkt.SetType(header.ICMPv6RouterAdvert)
+	pkt.SetCode(0)
+	ra := header.NDPRouterAdvert(pkt.NDPPayload())
+	opts := ra.Options()
+	opts.Serialize(optSer)
+	// Populate the Router Lifetime.
+	binary.BigEndian.PutUint16(pkt.NDPPayload()[2:], rl)
+	pkt.SetChecksum(header.ICMPv6Checksum(pkt, ip, header.IPv6AllNodesMulticastAddress, buffer.VectorisedView{}))
+	payloadLength := hdr.UsedLength()
+	iph := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+	iph.Encode(&header.IPv6Fields{
+		PayloadLength: uint16(payloadLength),
+		NextHeader:    uint8(icmp.ProtocolNumber6),
+		HopLimit:      header.NDPHopLimit,
+		SrcAddr:       ip,
+		DstAddr:       header.IPv6AllNodesMulticastAddress,
+	})
+
+	return hdr
+}
+
+// raBuf returns a valid NDP Router Advertisement.
+//
+// Note, raBuf does not populate any of the RA fields other than the
+// Router Lifetime.
+func raBuf(ip tcpip.Address, rl uint16) buffer.Prependable {
+	return raBufWithOpts(ip, rl, header.NDPOptionsSerializer{})
+}
+
+// raBufWithPI returns a valid NDP Router Advertisement with a single Prefix
+// Information option.
+//
+// Note, raBufWithPI does not populate any of the RA fields other than the
+// Router Lifetime.
+func raBufWithPI(ip tcpip.Address, rl uint16, prefix tcpip.AddressWithPrefix, onLink, auto bool, vl, pl uint32) buffer.Prependable {
+	flags := uint8(0)
+	if onLink {
+		flags |= 128
+	}
+	if auto {
+		flags |= 64
+	}
+
+	buf := [30]byte{}
+	buf[0] = uint8(prefix.PrefixLen)
+	buf[1] = flags
+	binary.BigEndian.PutUint32(buf[2:], vl)
+	binary.BigEndian.PutUint32(buf[6:], pl)
+	copy(buf[14:], prefix.Address)
+	return raBufWithOpts(ip, rl, header.NDPOptionsSerializer{
+		header.NDPPrefixInformation(buf[:]),
+	})
+}
+
+// TestNoRouterDiscovery tests that router discovery will not be performed if
+// configured not to.
+func TestNoRouterDiscovery(t *testing.T) {
+	for i := 0; i < 7; i++ {
+		handle := i&1 != 0
+		discover := i&2 != 0
+		forwarding := i&4 == 0
+
+		t.Run(fmt.Sprintf("HandleRAs(%t), DiscoverDefaultRouters(%t), Forwarding(%t)", handle, discover, forwarding), func(t *testing.T) {
+			t.Parallel()
+
+			ndpDisp := ndpDispatcher{
+				routerC: make(chan ndpRouterEvent, 10),
+			}
+			e := channel.New(10, 1280, linkAddr1)
+			s := stack.New(stack.Options{
+				NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+				NDPConfigs: stack.NDPConfigurations{
+					HandleRAs:              handle,
+					DiscoverDefaultRouters: discover,
+				},
+				NDPDisp: &ndpDisp,
+			})
+			s.SetForwarding(forwarding)
+
+			if err := s.CreateNIC(1, e); err != nil {
+				t.Fatalf("CreateNIC(1) = %s", err)
+			}
+
+			// Rx an RA with non-zero lifetime.
+			e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, 1000).View().ToVectorisedView())
+			select {
+			case <-ndpDisp.routerC:
+				t.Fatal("unexpectedly discovered a router when configured not to")
+			case <-time.After(defaultTimeout):
+			}
+		})
+	}
+}
+
+// TestRouterDiscoveryDispatcherNoRemember tests that the stack does not
+// remember a discovered router when the dispatcher asks it not to.
+func TestRouterDiscoveryDispatcherNoRemember(t *testing.T) {
+	ndpDisp := ndpDispatcher{
+		routerC: make(chan ndpRouterEvent, 10),
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			DiscoverDefaultRouters: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	routeTable := []tcpip.Route{
+		{
+			header.IPv6EmptySubnet,
+			llAddr3,
+			1,
+		},
+	}
+	s.SetRouteTable(routeTable)
+
+	// Rx an RA with short lifetime.
+	lifetime := time.Duration(1)
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, uint16(lifetime)).View().ToVectorisedView())
+	select {
+	case r := <-ndpDisp.routerC:
+		if r.nicid != 1 {
+			t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+		}
+		if r.addr != llAddr2 {
+			t.Fatalf("got r.addr = %s, want = %s", r.addr, llAddr2)
+		}
+		if !r.discovered {
+			t.Fatal("got r.discovered = false, want = true")
+		}
+	case <-time.After(defaultTimeout):
+		t.Fatal("timeout waiting for router discovery event")
+	}
+
+	// Original route table should not have been modified.
+	if got := s.GetRouteTable(); !reflect.DeepEqual(got, routeTable) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, routeTable)
+	}
+
+	// Wait for the normal invalidation time plus an extra second to
+	// make sure we do not actually receive any invalidation events as
+	// we should not have remembered the router in the first place.
+	select {
+	case <-ndpDisp.routerC:
+		t.Fatal("should not have received any router events")
+	case <-time.After(lifetime*time.Second + defaultTimeout):
+	}
+
+	// Original route table should not have been modified.
+	if got := s.GetRouteTable(); !reflect.DeepEqual(got, routeTable) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, routeTable)
+	}
+}
+
+func TestRouterDiscovery(t *testing.T) {
+	ndpDisp := ndpDispatcher{
+		routerC:        make(chan ndpRouterEvent, 10),
+		rememberRouter: true,
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			DiscoverDefaultRouters: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	waitForEvent := func(addr tcpip.Address, discovered bool, timeout time.Duration) {
+		t.Helper()
+
+		select {
+		case r := <-ndpDisp.routerC:
+			if r.nicid != 1 {
+				t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+			}
+			if r.addr != addr {
+				t.Fatalf("got r.addr = %s, want = %s", r.addr, addr)
+			}
+			if r.discovered != discovered {
+				t.Fatalf("got r.discovered = %t, want = %t", r.discovered, discovered)
+			}
+		case <-time.After(timeout):
+			t.Fatal("timeout waiting for router discovery event")
+		}
+	}
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	// Rx an RA from lladdr2 with zero lifetime. It should not be
+	// remembered.
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, 0).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.routerC:
+		t.Fatal("unexpectedly discovered a router with 0 lifetime")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Rx an RA from lladdr2 with a huge lifetime.
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, 1000).View().ToVectorisedView())
+	waitForEvent(llAddr2, true, defaultTimeout)
+
+	// Should have a default route through the discovered router.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{header.IPv6EmptySubnet, llAddr2, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Rx an RA from another router (lladdr3) with non-zero lifetime.
+	l3Lifetime := time.Duration(6)
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr3, uint16(l3Lifetime)).View().ToVectorisedView())
+	waitForEvent(llAddr3, true, defaultTimeout)
+
+	// Should have default routes through the discovered routers.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{header.IPv6EmptySubnet, llAddr2, 1}, {header.IPv6EmptySubnet, llAddr3, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Rx an RA from lladdr2 with lesser lifetime.
+	l2Lifetime := time.Duration(2)
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, uint16(l2Lifetime)).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.routerC:
+		t.Fatal("Should not receive a router event when updating lifetimes for known routers")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Should still have a default route through the discovered routers.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{header.IPv6EmptySubnet, llAddr2, 1}, {header.IPv6EmptySubnet, llAddr3, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Wait for lladdr2's router invalidation timer to fire. The lifetime
+	// of the router should have been updated to the most recent (smaller)
+	// lifetime.
+	//
+	// Wait for the normal lifetime plus an extra bit for the
+	// router to get invalidated. If we don't get an invalidation
+	// event after this time, then something is wrong.
+	waitForEvent(llAddr2, false, l2Lifetime*time.Second+defaultTimeout)
+
+	// Should no longer have the default route through lladdr2.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{header.IPv6EmptySubnet, llAddr3, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Rx an RA from lladdr2 with huge lifetime.
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, 1000).View().ToVectorisedView())
+	waitForEvent(llAddr2, true, defaultTimeout)
+
+	// Should have a default route through the discovered routers.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{header.IPv6EmptySubnet, llAddr3, 1}, {header.IPv6EmptySubnet, llAddr2, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Rx an RA from lladdr2 with zero lifetime. It should be invalidated.
+	e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr2, 0).View().ToVectorisedView())
+	waitForEvent(llAddr2, false, defaultTimeout)
+
+	// Should have deleted the default route through the router that just
+	// got invalidated.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{header.IPv6EmptySubnet, llAddr3, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Wait for lladdr3's router invalidation timer to fire. The lifetime
+	// of the router should have been updated to the most recent (smaller)
+	// lifetime.
+	//
+	// Wait for the normal lifetime plus an extra bit for the
+	// router to get invalidated. If we don't get an invalidation
+	// event after this time, then something is wrong.
+	waitForEvent(llAddr3, false, l3Lifetime*time.Second+defaultTimeout)
+
+	// Should not have any routes now that all discovered routers have been
+	// invalidated.
+	if got := len(s.GetRouteTable()); got != 0 {
+		t.Fatalf("got len(s.GetRouteTable()) = %d, want = 0", got)
+	}
+}
+
+// TestRouterDiscoveryMaxRouters tests that only
+// stack.MaxDiscoveredDefaultRouters discovered routers are remembered.
+func TestRouterDiscoveryMaxRouters(t *testing.T) {
+	ndpDisp := ndpDispatcher{
+		routerC:        make(chan ndpRouterEvent, 10),
+		rememberRouter: true,
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			DiscoverDefaultRouters: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	expectedRt := [stack.MaxDiscoveredDefaultRouters]tcpip.Route{}
+
+	// Receive an RA from 2 more than the max number of discovered routers.
+	for i := 1; i <= stack.MaxDiscoveredDefaultRouters+2; i++ {
+		linkAddr := []byte{2, 2, 3, 4, 5, 0}
+		linkAddr[5] = byte(i)
+		llAddr := header.LinkLocalAddr(tcpip.LinkAddress(linkAddr))
+
+		e.Inject(header.IPv6ProtocolNumber, raBuf(llAddr, 5).View().ToVectorisedView())
+
+		if i <= stack.MaxDiscoveredDefaultRouters {
+			expectedRt[i-1] = tcpip.Route{header.IPv6EmptySubnet, llAddr, 1}
+			select {
+			case r := <-ndpDisp.routerC:
+				if r.nicid != 1 {
+					t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+				}
+				if r.addr != llAddr {
+					t.Fatalf("got r.addr = %s, want = %s", r.addr, llAddr)
+				}
+				if !r.discovered {
+					t.Fatal("got r.discovered = false, want = true")
+				}
+			case <-time.After(defaultTimeout):
+				t.Fatal("timeout waiting for router discovery event")
+			}
+
+		} else {
+			select {
+			case <-ndpDisp.routerC:
+				t.Fatal("should not have discovered a new router after we already discovered the max number of routers")
+			case <-time.After(defaultTimeout):
+			}
+		}
+	}
+
+	// Should only have default routes for the first
+	// stack.MaxDiscoveredDefaultRouters discovered routers.
+	if got := s.GetRouteTable(); !reflect.DeepEqual(got, expectedRt[:]) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, expectedRt)
+	}
+}
+
+// TestNoPrefixDiscovery tests that prefix discovery will not be performed if
+// configured not to.
+func TestNoPrefixDiscovery(t *testing.T) {
+	prefix := tcpip.AddressWithPrefix{
+		Address:   tcpip.Address("\x01\x02\x03\x04\x05\x06\x07\x08\x00\x00\x00\x00\x00\x00\x00\x00"),
+		PrefixLen: 64,
+	}
+
+	for i := 0; i < 7; i++ {
+		handle := i&1 != 0
+		discover := i&2 != 0
+		forwarding := i&4 == 0
+
+		t.Run(fmt.Sprintf("HandleRAs(%t), DiscoverOnLinkPrefixes(%t), Forwarding(%t)", handle, discover, forwarding), func(t *testing.T) {
+			t.Parallel()
+
+			ndpDisp := ndpDispatcher{
+				prefixC: make(chan ndpPrefixEvent, 10),
+			}
+			e := channel.New(10, 1280, linkAddr1)
+			s := stack.New(stack.Options{
+				NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+				NDPConfigs: stack.NDPConfigurations{
+					HandleRAs:              handle,
+					DiscoverOnLinkPrefixes: discover,
+				},
+				NDPDisp: &ndpDisp,
+			})
+			s.SetForwarding(forwarding)
+
+			if err := s.CreateNIC(1, e); err != nil {
+				t.Fatalf("CreateNIC(1) = %s", err)
+			}
+
+			// Rx an RA with prefix with non-zero lifetime.
+			e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, true, false, 10, 0).View().ToVectorisedView())
+
+			select {
+			case <-ndpDisp.prefixC:
+				t.Fatal("unexpectedly discovered a prefix when configured not to")
+			case <-time.After(defaultTimeout):
+			}
+		})
+	}
+}
+
+// TestPrefixDiscoveryDispatcherNoRemember tests that the stack does not
+// remember a discovered on-link prefix when the dispatcher asks it not to.
+func TestPrefixDiscoveryDispatcherNoRemember(t *testing.T) {
+	prefix, subnet, _ := prefixSubnetAddr(0, "")
+
+	ndpDisp := ndpDispatcher{
+		prefixC: make(chan ndpPrefixEvent, 10),
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			DiscoverDefaultRouters: false,
+			DiscoverOnLinkPrefixes: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	routeTable := []tcpip.Route{
+		{
+			header.IPv6EmptySubnet,
+			llAddr3,
+			1,
+		},
+	}
+	s.SetRouteTable(routeTable)
+
+	// Rx an RA with prefix with a short lifetime.
+	const lifetime = 1
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, true, false, lifetime, 0).View().ToVectorisedView())
+	select {
+	case r := <-ndpDisp.prefixC:
+		if r.nicid != 1 {
+			t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+		}
+		if r.prefix != subnet {
+			t.Fatalf("got r.prefix = %s, want = %s", r.prefix, subnet)
+		}
+		if !r.discovered {
+			t.Fatal("got r.discovered = false, want = true")
+		}
+	case <-time.After(defaultTimeout):
+		t.Fatal("timeout waiting for prefix discovery event")
+	}
+
+	// Original route table should not have been modified.
+	if got := s.GetRouteTable(); !reflect.DeepEqual(got, routeTable) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, routeTable)
+	}
+
+	// Wait for the normal invalidation time plus some buffer to
+	// make sure we do not actually receive any invalidation events as
+	// we should not have remembered the prefix in the first place.
+	select {
+	case <-ndpDisp.prefixC:
+		t.Fatal("should not have received any prefix events")
+	case <-time.After(lifetime*time.Second + defaultTimeout):
+	}
+
+	// Original route table should not have been modified.
+	if got := s.GetRouteTable(); !reflect.DeepEqual(got, routeTable) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, routeTable)
+	}
+}
+
+func TestPrefixDiscovery(t *testing.T) {
+	prefix1, subnet1, _ := prefixSubnetAddr(0, "")
+	prefix2, subnet2, _ := prefixSubnetAddr(1, "")
+	prefix3, subnet3, _ := prefixSubnetAddr(2, "")
+
+	ndpDisp := ndpDispatcher{
+		prefixC:        make(chan ndpPrefixEvent, 10),
+		rememberPrefix: true,
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			DiscoverDefaultRouters: false,
+			DiscoverOnLinkPrefixes: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	waitForEvent := func(subnet tcpip.Subnet, discovered bool, timeout time.Duration) {
+		t.Helper()
+
+		select {
+		case r := <-ndpDisp.prefixC:
+			if r.nicid != 1 {
+				t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+			}
+			if r.prefix != subnet {
+				t.Fatalf("got r.prefix = %s, want = %s", r.prefix, subnet)
+			}
+			if r.discovered != discovered {
+				t.Fatalf("got r.discovered = %t, want = %t", r.discovered, discovered)
+			}
+		case <-time.After(timeout):
+			t.Fatal("timeout waiting for prefix discovery event")
+		}
+	}
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	// Receive an RA with prefix1 in an NDP Prefix Information option (PI)
+	// with zero valid lifetime.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, false, 0, 0).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.prefixC:
+		t.Fatal("unexpectedly discovered a prefix with 0 lifetime")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Receive an RA with prefix1 in an NDP Prefix Information option (PI)
+	// with non-zero lifetime.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, false, 100, 0).View().ToVectorisedView())
+	waitForEvent(subnet1, true, defaultTimeout)
+
+	// Should have added a device route for subnet1 through the nic.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{subnet1, tcpip.Address([]byte(nil)), 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Receive an RA with prefix2 in a PI.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix2, true, false, 100, 0).View().ToVectorisedView())
+	waitForEvent(subnet2, true, defaultTimeout)
+
+	// Should have added a device route for subnet2 through the nic.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{subnet1, tcpip.Address([]byte(nil)), 1}, {subnet2, tcpip.Address([]byte(nil)), 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Receive an RA with prefix3 in a PI.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix3, true, false, 100, 0).View().ToVectorisedView())
+	waitForEvent(subnet3, true, defaultTimeout)
+
+	// Should have added a device route for subnet3 through the nic.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{subnet1, tcpip.Address([]byte(nil)), 1}, {subnet2, tcpip.Address([]byte(nil)), 1}, {subnet3, tcpip.Address([]byte(nil)), 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Receive an RA with prefix1 in a PI with lifetime = 0.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, false, 0, 0).View().ToVectorisedView())
+	waitForEvent(subnet1, false, defaultTimeout)
+
+	// Should have removed the device route for subnet1 through the nic.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{subnet2, tcpip.Address([]byte(nil)), 1}, {subnet3, tcpip.Address([]byte(nil)), 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Receive an RA with prefix2 in a PI with lesser lifetime.
+	lifetime := uint32(2)
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix2, true, false, lifetime, 0).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.prefixC:
+		t.Fatal("unexpectedly received prefix event when updating lifetime")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Should not have updated route table.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{subnet2, tcpip.Address([]byte(nil)), 1}, {subnet3, tcpip.Address([]byte(nil)), 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Wait for prefix2's most recent invalidation timer plus some buffer to
+	// expire.
+	waitForEvent(subnet2, false, time.Duration(lifetime)*time.Second+defaultTimeout)
+
+	// Should have removed the device route for subnet2 through the nic.
+	if got, want := s.GetRouteTable(), []tcpip.Route{{subnet3, tcpip.Address([]byte(nil)), 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, want)
+	}
+
+	// Receive RA to invalidate prefix3.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix3, true, false, 0, 0).View().ToVectorisedView())
+	waitForEvent(subnet3, false, defaultTimeout)
+
+	// Should not have any routes.
+	if got := len(s.GetRouteTable()); got != 0 {
+		t.Fatalf("got len(s.GetRouteTable()) = %d, want = 0", got)
+	}
+}
+
+// TestPrefixDiscoveryMaxRouters tests that only
+// stack.MaxDiscoveredOnLinkPrefixes discovered on-link prefixes are remembered.
+func TestPrefixDiscoveryMaxOnLinkPrefixes(t *testing.T) {
+	ndpDisp := ndpDispatcher{
+		prefixC:        make(chan ndpPrefixEvent, stack.MaxDiscoveredOnLinkPrefixes+3),
+		rememberPrefix: true,
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			DiscoverDefaultRouters: false,
+			DiscoverOnLinkPrefixes: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	optSer := make(header.NDPOptionsSerializer, stack.MaxDiscoveredOnLinkPrefixes+2)
+	expectedRt := [stack.MaxDiscoveredOnLinkPrefixes]tcpip.Route{}
+	prefixes := [stack.MaxDiscoveredOnLinkPrefixes + 2]tcpip.Subnet{}
+
+	// Receive an RA with 2 more than the max number of discovered on-link
+	// prefixes.
+	for i := 0; i < stack.MaxDiscoveredOnLinkPrefixes+2; i++ {
+		prefixAddr := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0}
+		prefixAddr[7] = byte(i)
+		prefix := tcpip.AddressWithPrefix{
+			Address:   tcpip.Address(prefixAddr[:]),
+			PrefixLen: 64,
+		}
+		prefixes[i] = prefix.Subnet()
+		buf := [30]byte{}
+		buf[0] = uint8(prefix.PrefixLen)
+		buf[1] = 128
+		binary.BigEndian.PutUint32(buf[2:], 10)
+		copy(buf[14:], prefix.Address)
+
+		optSer[i] = header.NDPPrefixInformation(buf[:])
+
+		if i < stack.MaxDiscoveredOnLinkPrefixes {
+			expectedRt[i] = tcpip.Route{prefixes[i], tcpip.Address([]byte(nil)), 1}
+		}
+	}
+
+	e.Inject(header.IPv6ProtocolNumber, raBufWithOpts(llAddr1, 0, optSer).View().ToVectorisedView())
+	for i := 0; i < stack.MaxDiscoveredOnLinkPrefixes+2; i++ {
+		if i < stack.MaxDiscoveredOnLinkPrefixes {
+			select {
+			case r := <-ndpDisp.prefixC:
+				if r.nicid != 1 {
+					t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+				}
+				if r.prefix != prefixes[i] {
+					t.Fatalf("got r.prefix = %s, want = %s", r.prefix, prefixes[i])
+				}
+				if !r.discovered {
+					t.Fatal("got r.discovered = false, want = true")
+				}
+			case <-time.After(defaultTimeout):
+				t.Fatal("timeout waiting for prefix discovery event")
+			}
+		} else {
+			select {
+			case <-ndpDisp.prefixC:
+				t.Fatal("should not have discovered a new prefix after we already discovered the max number of prefixes")
+			case <-time.After(defaultTimeout):
+			}
+		}
+	}
+
+	// Should only have device routes for the first
+	// stack.MaxDiscoveredOnLinkPrefixes discovered on-link prefixes.
+	if got := s.GetRouteTable(); !reflect.DeepEqual(got, expectedRt[:]) {
+		t.Fatalf("got GetRouteTable = %v, want = %v", got, expectedRt)
+	}
+}
+
+// Checks to see if list contains an IPv6 address, item.
+func contains(list []tcpip.ProtocolAddress, item tcpip.AddressWithPrefix) bool {
+	for _, i := range list {
+		if i.Protocol != header.IPv6ProtocolNumber {
+			continue
+		}
+
+		if i.AddressWithPrefix == item {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestNoAutoGenAddr tests that SLAAC is not performed when configured not to.
+func TestNoAutoGenAddr(t *testing.T) {
+	prefix, _, _ := prefixSubnetAddr(0, "")
+
+	for i := 0; i < 7; i++ {
+		handle := i&1 != 0
+		autogen := i&2 != 0
+		forwarding := i&4 == 0
+
+		t.Run(fmt.Sprintf("HandleRAs(%t), AutoGenAddr(%t), Forwarding(%t)", handle, autogen, forwarding), func(t *testing.T) {
+			t.Parallel()
+
+			ndpDisp := ndpDispatcher{
+				autoGenAddrC: make(chan ndpAutoGenAddrEvent, 10),
+			}
+			e := channel.New(10, 1280, linkAddr1)
+			s := stack.New(stack.Options{
+				NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+				NDPConfigs: stack.NDPConfigurations{
+					HandleRAs:              handle,
+					AutoGenGlobalAddresses: autogen,
+				},
+				NDPDisp: &ndpDisp,
+			})
+			s.SetForwarding(forwarding)
+
+			if err := s.CreateNIC(1, e); err != nil {
+				t.Fatalf("CreateNIC(1) = %s", err)
+			}
+
+			// Rx an RA with prefix with non-zero lifetime.
+			e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, false, true, 10, 0).View().ToVectorisedView())
+
+			select {
+			case <-ndpDisp.autoGenAddrC:
+				t.Fatal("unexpectedly auto-generated an address when configured not to")
+			case <-time.After(defaultTimeout):
+			}
+		})
+	}
+}
+
+// TestAutoGenAddr tests that an address is properly generated and invalidated
+// when configured to do so.
+func TestAutoGenAddr(t *testing.T) {
+	const newMinVL = 2
+	newMinVLDuration := newMinVL * time.Second
+	saved := stack.MinPrefixInformationValidLifetimeForUpdate
+	defer func() {
+		stack.MinPrefixInformationValidLifetimeForUpdate = saved
+	}()
+	stack.MinPrefixInformationValidLifetimeForUpdate = newMinVLDuration
+
+	prefix1, _, addr1 := prefixSubnetAddr(0, linkAddr1)
+	prefix2, _, addr2 := prefixSubnetAddr(1, linkAddr1)
+
+	ndpDisp := ndpDispatcher{
+		autoGenAddrC: make(chan ndpAutoGenAddrEvent, 10),
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			AutoGenGlobalAddresses: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	waitForEvent := func(addr tcpip.AddressWithPrefix, eventType ndpAutoGenAddrEventType, timeout time.Duration) {
+		t.Helper()
+
+		select {
+		case r := <-ndpDisp.autoGenAddrC:
+			if r.nicid != 1 {
+				t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+			}
+			if r.addr != addr {
+				t.Fatalf("got r.addr = %s, want = %s", r.addr, addr)
+			}
+			if r.eventType != eventType {
+				t.Fatalf("got r.eventType = %v, want = %v", r.eventType, eventType)
+			}
+		case <-time.After(timeout):
+			t.Fatal("timeout waiting for addr auto gen event")
+		}
+	}
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	// Receive an RA with prefix1 in an NDP Prefix Information option (PI)
+	// with zero valid lifetime.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, true, 0, 0).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.autoGenAddrC:
+		t.Fatal("unexpectedly auto-generated an address with 0 lifetime")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Receive an RA with prefix1 in an NDP Prefix Information option (PI)
+	// with non-zero lifetime.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, true, 100, 0).View().ToVectorisedView())
+	waitForEvent(addr1, newAddr, defaultTimeout)
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr1) {
+		t.Fatalf("Should have %s in the list of addresses", addr1)
+	}
+
+	// Receive an RA with prefix2 in an NDP Prefix Information option (PI)
+	// with preferred lifetime > valid lifetime
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, true, 5, 6).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.autoGenAddrC:
+		t.Fatal("unexpectedly auto-generated an address with preferred lifetime > valid lifetime")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Receive an RA with prefix2 in a PI.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix2, true, true, 100, 0).View().ToVectorisedView())
+	waitForEvent(addr2, newAddr, defaultTimeout)
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr1) {
+		t.Fatalf("Should have %s in the list of addresses", addr1)
+	}
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr2) {
+		t.Fatalf("Should have %s in the list of addresses", addr2)
+	}
+
+	// Refresh valid lifetime for addr of prefix1.
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix1, true, true, newMinVL, 0).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.autoGenAddrC:
+		t.Fatal("unexpectedly auto-generated an address when we already have an address for a prefix")
+	case <-time.After(defaultTimeout):
+	}
+
+	// Wait for addr of prefix1 to be invalidated.
+	waitForEvent(addr1, invalidatedAddr, newMinVLDuration+defaultTimeout)
+	if contains(s.NICInfo()[1].ProtocolAddresses, addr1) {
+		t.Fatalf("Should not have %s in the list of addresses", addr1)
+	}
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr2) {
+		t.Fatalf("Should have %s in the list of addresses", addr2)
+	}
+}
+
+// TestAutoGenAddrValidLifetimeUpdates tests that the valid lifetime of an
+// auto-generated address only gets updated when required to, as specified in
+// RFC 4862 section 5.5.3.e.
+func TestAutoGenAddrValidLifetimeUpdates(t *testing.T) {
+	const infiniteVL = 4294967295
+	const newMinVL = 5
+	saved := stack.MinPrefixInformationValidLifetimeForUpdate
+	defer func() {
+		stack.MinPrefixInformationValidLifetimeForUpdate = saved
+	}()
+	stack.MinPrefixInformationValidLifetimeForUpdate = newMinVL * time.Second
+
+	prefix, _, addr := prefixSubnetAddr(0, linkAddr1)
+
+	tests := []struct {
+		name string
+		ovl  uint32
+		nvl  uint32
+		evl  uint32
+	}{
+		// Should update the VL to the minimum VL for updating if the
+		// new VL is less than newMinVL but was originally greater than
+		// it.
+		{
+			"LargeVLToVLLessThanMinVLForUpdate",
+			9999,
+			1,
+			newMinVL,
+		},
+		{
+			"LargeVLTo0",
+			9999,
+			0,
+			newMinVL,
+		},
+		{
+			"InfiniteVLToVLLessThanMinVLForUpdate",
+			infiniteVL,
+			1,
+			newMinVL,
+		},
+		{
+			"InfiniteVLTo0",
+			infiniteVL,
+			0,
+			newMinVL,
+		},
+
+		// Should not update VL if original VL was less than newMinVL
+		// and the new VL is also less than newMinVL.
+		{
+			"ShouldNotUpdateWhenBothOldAndNewAreLessThanMinVLForUpdate",
+			newMinVL - 1,
+			newMinVL - 3,
+			newMinVL - 1,
+		},
+
+		// Should take the new VL if the new VL is greater than the
+		// remaining time or is greater than newMinVL.
+		{
+			"MorethanMinVLToLesserButStillMoreThanMinVLForUpdate",
+			newMinVL + 5,
+			newMinVL + 3,
+			newMinVL + 3,
+		},
+		{
+			"SmallVLToGreaterVLButStillLessThanMinVLForUpdate",
+			newMinVL - 3,
+			newMinVL - 1,
+			newMinVL - 1,
+		},
+		{
+			"SmallVLToGreaterVLThatIsMoreThaMinVLForUpdate",
+			newMinVL - 3,
+			newMinVL + 1,
+			newMinVL + 1,
+		},
+	}
+
+	const delta = 500 * time.Millisecond
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			ndpDisp := ndpDispatcher{
+				autoGenAddrC: make(chan ndpAutoGenAddrEvent, 10),
+			}
+			e := channel.New(10, 1280, linkAddr1)
+			s := stack.New(stack.Options{
+				NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+				NDPConfigs: stack.NDPConfigurations{
+					HandleRAs:              true,
+					AutoGenGlobalAddresses: true,
+				},
+				NDPDisp: &ndpDisp,
+			})
+
+			if err := s.CreateNIC(1, e); err != nil {
+				t.Fatalf("CreateNIC(1) = %s", err)
+			}
+
+			// Receive an RA with prefix with initial VL, test.ovl.
+			e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, true, true, test.ovl, 0).View().ToVectorisedView())
+			select {
+			case r := <-ndpDisp.autoGenAddrC:
+				if r.nicid != 1 {
+					t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+				}
+				if r.addr != addr {
+					t.Fatalf("got r.addr = %s, want = %s", r.addr, addr)
+				}
+				if r.eventType != newAddr {
+					t.Fatalf("got r.eventType = %v, want = %v", r.eventType, newAddr)
+				}
+			case <-time.After(defaultTimeout):
+				t.Fatal("timeout waiting for addr auto gen event")
+			}
+
+			// Receive an new RA with prefix with new VL, test.nvl.
+			e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, true, true, test.nvl, 0).View().ToVectorisedView())
+
+			//
+			// Validate that the VL for the address got set to
+			// test.evl.
+			//
+
+			// Make sure we do not get any invalidation events
+			// until atleast 500ms (delta) before test.evl.
+			select {
+			case <-ndpDisp.autoGenAddrC:
+				t.Fatalf("unexpectedly received an auto gen addr event")
+			case <-time.After(time.Duration(test.evl)*time.Second - delta):
+			}
+
+			// Wait for another second (2x delta), but now we expect
+			// the invalidation event.
+			select {
+			case r := <-ndpDisp.autoGenAddrC:
+				if r.nicid != 1 {
+					t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+				}
+				if r.addr != addr {
+					t.Fatalf("got r.addr = %s, want = %s", r.addr, addr)
+				}
+				if r.eventType != invalidatedAddr {
+					t.Fatalf("got r.eventType = %v, want = %v", r.eventType, newAddr)
+				}
+			case <-time.After(2 * delta):
+				t.Fatal("timeout waiting for addr auto gen event")
+			}
+		})
+	}
+}
+
+// TestAutoGenAddrRemoval tests that when auto-generated addresses are removed
+// by the user, its resources will be cleaned up and an invalidation event will
+// be sent to the integrator.
+func TestAutoGenAddrRemoval(t *testing.T) {
+	prefix, _, addr := prefixSubnetAddr(0, linkAddr1)
+
+	ndpDisp := ndpDispatcher{
+		autoGenAddrC: make(chan ndpAutoGenAddrEvent, 10),
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			AutoGenGlobalAddresses: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	// Receive an RA with prefix with its valid lifetime = lifetime.
+	const lifetime = 5
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, true, true, lifetime, 0).View().ToVectorisedView())
+	select {
+	case r := <-ndpDisp.autoGenAddrC:
+		if r.nicid != 1 {
+			t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+		}
+		if r.addr != addr {
+			t.Fatalf("got r.addr = %s, want = %s", r.addr, addr)
+		}
+		if r.eventType != newAddr {
+			t.Fatalf("got r.eventType = %v, want = %v", r.eventType, newAddr)
+		}
+	case <-time.After(defaultTimeout):
+		t.Fatal("timeout waiting for addr auto gen event")
+	}
+
+	// Remove the address.
+	if err := s.RemoveAddress(1, addr.Address); err != nil {
+		t.Fatalf("RemoveAddress(_, %s) = %s", addr.Address, err)
+	}
+
+	// Should get the invalidation event immediately.
+	select {
+	case r := <-ndpDisp.autoGenAddrC:
+		if r.nicid != 1 {
+			t.Fatalf("got r.nicid = %d, want = 1", r.nicid)
+		}
+		if r.addr != addr {
+			t.Fatalf("got r.addr = %s, want = %s", r.addr, addr)
+		}
+		if r.eventType != invalidatedAddr {
+			t.Fatalf("got r.eventType = %v, want = %v", r.eventType, newAddr)
+		}
+	case <-time.After(defaultTimeout):
+		t.Fatal("timeout waiting for addr auto gen event")
+	}
+
+	// Wait for the original valid lifetime to make sure the original timer
+	// got stopped/cleaned up.
+	select {
+	case <-ndpDisp.autoGenAddrC:
+		t.Fatalf("unexpectedly received an auto gen addr event")
+	case <-time.After(lifetime*time.Second + defaultTimeout):
+	}
+}
+
+// TestAutoGenAddrStaticConflict tests that if SLAAC generates an address that
+// is already assigned to the NIC, the static address remains.
+func TestAutoGenAddrStaticConflict(t *testing.T) {
+	prefix, _, addr := prefixSubnetAddr(0, linkAddr1)
+
+	ndpDisp := ndpDispatcher{
+		autoGenAddrC: make(chan ndpAutoGenAddrEvent, 10),
+	}
+	e := channel.New(10, 1280, linkAddr1)
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPConfigs: stack.NDPConfigurations{
+			HandleRAs:              true,
+			AutoGenGlobalAddresses: true,
+		},
+		NDPDisp: &ndpDisp,
+	})
+
+	if err := s.CreateNIC(1, e); err != nil {
+		t.Fatalf("CreateNIC(1) = %s", err)
+	}
+
+	// Add the address as a static address before SLAAC tries to add it.
+	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: header.IPv6ProtocolNumber, AddressWithPrefix: addr}); err != nil {
+		t.Fatalf("AddAddress(_, %d, %s) = %s", header.IPv6ProtocolNumber, addr.Address, err)
+	}
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr) {
+		t.Fatalf("Should have %s in the list of addresses", addr1)
+	}
+
+	// Receive a PI where the generated address will be the same as the one
+	// that we already have assigned statically.
+	const lifetime = 5
+	e.Inject(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, 0, prefix, true, true, lifetime, 0).View().ToVectorisedView())
+	select {
+	case <-ndpDisp.autoGenAddrC:
+		t.Fatal("unexpectedly received an auto gen addr event for an address we already have statically")
+	case <-time.After(defaultTimeout):
+	}
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr) {
+		t.Fatalf("Should have %s in the list of addresses", addr1)
+	}
+
+	// Should not get an invalidation event after the PI's invalidation
+	// time.
+	select {
+	case <-ndpDisp.autoGenAddrC:
+		t.Fatal("unexpectedly received an auto gen addr event")
+	case <-time.After(lifetime*time.Second + defaultTimeout):
+	}
+	if !contains(s.NICInfo()[1].ProtocolAddresses, addr) {
+		t.Fatalf("Should have %s in the list of addresses", addr1)
 	}
 }

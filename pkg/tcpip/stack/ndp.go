@@ -38,6 +38,34 @@ const (
 	// Default = 1s (from RFC 4861 section 10).
 	defaultRetransmitTimer = time.Second
 
+	// defaultHandleRAs is the default configuration for whether or not to
+	// handle incoming Router Advertisements as a host.
+	//
+	// Default = true.
+	defaultHandleRAs = true
+
+	// defaultDiscoverDefaultRouters is the default configuration for
+	// whether or not to discover default routers from incoming Router
+	// Advertisements, as a host.
+	//
+	// Default = true.
+	defaultDiscoverDefaultRouters = true
+
+	// defaultDiscoverOnLinkPrefixes is the default configuration for
+	// whether or not to discover on-link prefixes from incoming Router
+	// Advertisements' Prefix Information option, as a host.
+	//
+	// Default = true.
+	defaultDiscoverOnLinkPrefixes = true
+
+	// defaultAutoGenGlobalAddresses is the default configuration for
+	// whether or not to generate global IPv6 addresses in response to
+	// receiving a new Prefix Information option with its Autonomous
+	// Address AutoConfiguration flag set, as a host.
+	//
+	// Default = true.
+	defaultAutoGenGlobalAddresses = true
+
 	// minimumRetransmitTimer is the minimum amount of time to wait between
 	// sending NDP Neighbor solicitation messages. Note, RFC 4861 does
 	// not impose a minimum Retransmit Timer, but we do here to make sure
@@ -49,6 +77,49 @@ const (
 	//
 	// Min = 1ms.
 	minimumRetransmitTimer = time.Millisecond
+
+	// MaxDiscoveredDefaultRouters is the maximum number of discovered
+	// default routers. The stack should stop discovering new routers after
+	// discovering MaxDiscoveredDefaultRouters routers.
+	//
+	// This value MUST be at minimum 2 as per RFC 4861 section 6.3.4, and
+	// SHOULD be more.
+	//
+	// Max = 10.
+	MaxDiscoveredDefaultRouters = 10
+
+	// MaxDiscoveredOnLinkPrefixes is the maximum number of discovered
+	// on-link prefixes. The stack should stop discovering new on-link
+	// prefixes after discovering MaxDiscoveredOnLinkPrefixes on-link
+	// prefixes.
+	//
+	// Max = 10.
+	MaxDiscoveredOnLinkPrefixes = 10
+
+	// validPrefixLenForAutoGen is the expected prefix length that an
+	// address can be generated for. Must be 64 bits as the interface
+	// identifier (IID) is 64 bits and an IPv6 address is 128 bits, so
+	// 128 - 64 = 64.
+	validPrefixLenForAutoGen = 64
+
+	// iidOffsetInIPv6Address is the offset, in bytes, from the start
+	// of an IPv6 address to the beginning of the interface identifier
+	// (IID) for auto-generated addresses. That is, all bytes before
+	// this value is the prefix, and all bytes after this value is the
+	// IID.
+	iidOffsetInIPv6Address = 8
+)
+
+var (
+	// MinPrefixInformationValidLifetimeForUpdate is the minimum Valid
+	// Lifetime to update the valid lifetime of a generated address by
+	// SLAAC.
+	//
+	// This is exported as a variable (instead of a constant) so tests
+	// can update it to a smaller value.
+	//
+	// Min = 2hrs.
+	MinPrefixInformationValidLifetimeForUpdate = 2 * time.Hour
 )
 
 // NDPDispatcher is the interface integrators of netstack must implement to
@@ -65,6 +136,58 @@ type NDPDispatcher interface {
 	// This function is permitted to block indefinitely without interfering
 	// with the stack's operation.
 	OnDuplicateAddressDetectionStatus(nicid tcpip.NICID, addr tcpip.Address, resolved bool, err *tcpip.Error)
+
+	// OnDefaultRouterDiscovered will be called when a new default router is
+	// discovered. Implementations must return true along with a new valid
+	// route table if the newly discovered router should be remembered. If
+	// an implementation returns false, the second return value will be
+	// ignored.
+	//
+	// This function is not permitted to block indefinitely. This function
+	// is also not permitted to call into the stack.
+	OnDefaultRouterDiscovered(nicid tcpip.NICID, addr tcpip.Address) (bool, []tcpip.Route)
+
+	// OnDefaultRouterInvalidated will be called when a discovered default
+	// router is invalidated. Implementers must return a new valid route
+	// table.
+	//
+	// This function is not permitted to block indefinitely. This function
+	// is also not permitted to call into the stack.
+	OnDefaultRouterInvalidated(nicid tcpip.NICID, addr tcpip.Address) []tcpip.Route
+
+	// OnOnLinkPrefixDiscovered will be called when a new on-link prefix is
+	// discovered. Implementations must return true along with a new valid
+	// route table if the newly discovered on-link prefix should be
+	// remembered. If an implementation returns false, the second return
+	// value will be ignored.
+	//
+	// This function is not permitted to block indefinitely. This function
+	// is also not permitted to call into the stack.
+	OnOnLinkPrefixDiscovered(nicid tcpip.NICID, prefix tcpip.Subnet) (bool, []tcpip.Route)
+
+	// OnOnLinkPrefixInvalidated will be called when a discovered on-link
+	// prefix is invalidated. Implementers must return a new valid route
+	// table.
+	//
+	// This function is not permitted to block indefinitely. This function
+	// is also not permitted to call into the stack.
+	OnOnLinkPrefixInvalidated(nicid tcpip.NICID, prefix tcpip.Subnet) []tcpip.Route
+
+	// OnAutoGenAddress will be called when a new prefix with its
+	// autonomous address-configuration flag set has been received and SLAAC
+	// has been performed. Implementers can prevent the stack from assigning
+	// the address to the NIC (with ID nicid) by returning false.
+	//
+	// This function is not permitted to block indefinitely. It must not
+	// call functions on the stack itself.
+	OnAutoGenAddress(nicid tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix) bool
+
+	// OnAutoGenAddressInvalidated will be called when an auto-generated
+	// address (as part of SLAAC) has been invalidated.
+	//
+	// This function is not permitted to block indefinitely. It must not
+	// call functions on the stack itself.
+	OnAutoGenAddressInvalidated(nicid tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix)
 }
 
 // NDPConfigurations is the NDP configurations for the netstack.
@@ -80,6 +203,31 @@ type NDPConfigurations struct {
 	//
 	// Must be greater than 0.5s.
 	RetransmitTimer time.Duration
+
+	// HandleRAs determines whether or not Router Advertisements will be
+	// processed.
+	HandleRAs bool
+
+	// DiscoverDefaultRouters determines whether or not default routers will
+	// be discovered from Router Advertisements. This configuration is
+	// ignored if HandleRAs is false.
+	DiscoverDefaultRouters bool
+
+	// DiscoverOnLinkPrefixes determines whether or not on-link prefixes
+	// will be discovered from Router Advertisements' Prefix Information
+	// option. This configuration is ignored if HandleRAs is false.
+	DiscoverOnLinkPrefixes bool
+
+	// AutoGenGlobalAddresses determines whether or not global IPv6
+	// addresses will be generated for a NIC in response to receiving a new
+	// Prefix Information option with its Autonomous Address
+	// AutoConfiguration flag set, as a host, as part of RFC 4862 (SLAAC).
+	//
+	// Note, if an address was already generated for some unique prefix, as
+	// part of SLAAC, this option does not affect whether or not the
+	// lifetime(s) of the generated address changes; this option only
+	// affects the generation of NEW addresses as part of SLAAC.
+	AutoGenGlobalAddresses bool
 }
 
 // DefaultNDPConfigurations returns an NDPConfigurations populated with
@@ -88,6 +236,10 @@ func DefaultNDPConfigurations() NDPConfigurations {
 	return NDPConfigurations{
 		DupAddrDetectTransmits: defaultDupAddrDetectTransmits,
 		RetransmitTimer:        defaultRetransmitTimer,
+		HandleRAs:              defaultHandleRAs,
+		DiscoverDefaultRouters: defaultDiscoverDefaultRouters,
+		DiscoverOnLinkPrefixes: defaultDiscoverOnLinkPrefixes,
+		AutoGenGlobalAddresses: defaultAutoGenGlobalAddresses,
 	}
 }
 
@@ -112,6 +264,16 @@ type ndpState struct {
 
 	// The DAD state to send the next NS message, or resolve the address.
 	dad map[tcpip.Address]dadState
+
+	// The default routers discovered through Router Advertisements.
+	defaultRouters map[tcpip.Address]defaultRouterState
+
+	// The on-link prefixes discovered through Router Advertisements' Prefix
+	// Information option.
+	onLinkPrefixes map[tcpip.Subnet]onLinkPrefixState
+
+	// The addresses generated by SLAAC.
+	autoGenAddresses map[tcpip.Address]autoGenAddressState
 }
 
 // dadState holds the Duplicate Address Detection timer and channel to signal
@@ -125,6 +287,63 @@ type dadState struct {
 	// Must only be read from or written to while protected by the lock of
 	// the NIC this dadState is associated with.
 	done *bool
+}
+
+// defaultRouterState holds data associated with a default router discovered by
+// a Router Advertisement (RA) when the NDP configurations was configured to do
+// so.
+type defaultRouterState struct {
+	invalidationTimer *time.Timer
+
+	// Used to signal the timer not to invalidate the default router (R) in
+	// a race condition (T1 is a goroutine that handles an RA from R and T2
+	// is the goroutine that handles R's invalidation timer firing):
+	//   T1: Receive a new RA from R
+	//   T1: Obtain the NIC's lock before processing the RA
+	//   T2: R's invalidation timer fires, and gets blocked on obtaining the
+	//       NIC's lock
+	//   T2: Refreshes/extends R's lifetime & releases NIC's lock
+	//   T1: Obtains NIC's lock & invalidates R immediately
+	//
+	// To resolve this, T1 will check to see if the timer already fired, and
+	// signal the timer using this channel to not invalidate R, so that once
+	// T1 obtains the lock, it will see that there is an event on this
+	// channel and do nothing further.
+	doNotInvalidateC chan struct{}
+}
+
+// onLinkPrefixState holds data associated with an on-link prefix discovered by
+// a Router Advertisement's Prefix Information option (PI) when the NDP
+// configurations was configured to do so.
+type onLinkPrefixState struct {
+	invalidationTimer *time.Timer
+
+	// Used to signal the timer not to invalidate the on-link prefix (P) in
+	// a race condition (T1 is a goroutine that handles a PI for P and T2
+	// is the goroutine that handles P's invalidation timer firing):
+	//   T1: Receive a new PI for P
+	//   T1: Obtain the NIC's lock before processing the PI
+	//   T2: P's invalidation timer fires, and gets blocked on obtaining the
+	//       NIC's lock
+	//   T2: Refreshes/extends P's lifetime & releases NIC's lock
+	//   T1: Obtains NIC's lock & invalidates P immediately
+	//
+	// To resolve this, T1 will check to see if the timer already fired, and
+	// signal the timer using this channel to not invalidate P, so that once
+	// T1 obtains the lock, it will see that there is an event on this
+	// channel and do nothing further.
+	doNotInvalidateC chan struct{}
+}
+
+// autoGenAddressState holds data associated with an address generated via
+// SLAAC.
+type autoGenAddressState struct {
+	invalidationTimer *time.Timer
+	doNotInvalidateC  chan struct{}
+
+	// Used only when the address is not valid forever (invalidationTimer is
+	// not nil).
+	validUntil time.Time
 }
 
 // startDuplicateAddressDetection performs Duplicate Address Detection.
@@ -318,4 +537,616 @@ func (ndp *ndpState) stopDuplicateAddressDetection(addr tcpip.Address) {
 	if ndp.nic.stack.ndpDisp != nil {
 		go ndp.nic.stack.ndpDisp.OnDuplicateAddressDetectionStatus(ndp.nic.ID(), addr, false, nil)
 	}
+}
+
+// handleRA handles a Router Advertisement message that arrived on the NIC (n)
+// this ndp is for. Does nothing if the NIC is configured to not handle RAs or
+// if the NIC is a routing interface.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) handleRA(ip tcpip.Address, ra header.NDPRouterAdvert) {
+	// Is the NIC configured to handle RAs at all?
+	//
+	// Currently, the stack does not determine router interface status on a
+	// per-interface basis; it is a stack-wide configuration, so we check
+	// stack's forwarding flag to determine if the NIC is a routing
+	// interface.
+	if !ndp.configs.HandleRAs || ndp.nic.stack.forwarding {
+		return
+	}
+
+	// Is the NIC configured to discover default routers?
+	if ndp.configs.DiscoverDefaultRouters {
+		rtr, ok := ndp.defaultRouters[ip]
+		rl := ra.RouterLifetime()
+		if !ok && rl != 0 {
+			// This is a new default router we are discovering.
+			//
+			// Only remember it if we currently know about less than
+			// MaxDiscoveredDefaultRouters routers.
+			if len(ndp.defaultRouters) < MaxDiscoveredDefaultRouters {
+				ndp.rememberDefaultRouter(ip, rl)
+			}
+		} else if ok && rl != 0 {
+			// This is an already discovered default router. Update
+			// the invalidation timer.
+			timer := rtr.invalidationTimer
+
+			// We should ALWAYS have an invalidation timer for a
+			// discovered router.
+			if timer == nil {
+				panic("ndphandlera: RA invalidation timer should not be nil")
+			}
+
+			if !timer.Stop() {
+				// If we reach this point, then we know the
+				// timer fired after we already took the NIC
+				// lock. Signal the timer so that once it
+				// obtains the lock, it doesn't actually
+				// invalidate the router as we just got a new
+				// RA that refreshes its lifetime to a non-zero
+				// value. See
+				// defaultRouterState.doNotInvalidateC for more
+				// details.
+				rtr.doNotInvalidateC <- struct{}{}
+			}
+
+			timer.Reset(rl)
+		} else if ok && rl == 0 {
+			// We know about the router but it is no longer to be
+			// used as a default router so invalidate it.
+			ndp.invalidateDefaultRouter(ip)
+		}
+	}
+
+	// TODO(b/141556115): Do (RetransTimer, ReachableTime)) Parameter
+	//                    Discovery.
+
+	// We know the options is valid as far as wire format is concerned since
+	// we got the Router Advertisement, as documented by this fn. Given this
+	// we do not check the iterator or errors on calls to Next.
+	it, _ := ra.Options().Iter(false)
+	for opt, done, _ := it.Next(); !done; opt, done, _ = it.Next() {
+		if opt.Type() == header.NDPPrefixInformationType {
+			pi := opt.(header.NDPPrefixInformation)
+
+			prefix := pi.Subnet()
+
+			// Is the prefix a link-local?
+			if header.IsV6LinkLocalAddress(prefix.ID()) {
+				// ...Yes, skip as per RFC 4861 section 6.3.4,
+				// and RFC 4862 section 5.5.3.b (for SLAAC).
+				continue
+			}
+
+			// Is the Prefix Length 0?
+			if prefix.Prefix() == 0 {
+				// ...Yes, skip as this is an invalid prefix
+				// as all IPv6 addresses cannot be on-link.
+				continue
+			}
+
+			if pi.OnLinkFlag() {
+				ndp.handleOnLinkPrefixInformation(pi)
+			}
+
+			if pi.AutonomousAddressConfigurationFlag() {
+				ndp.handleAutonomousPrefixInformation(pi)
+			}
+		} else {
+			// TODO(b/141556115): Do (MTU) Parameter Discovery.
+		}
+	}
+}
+
+// invalidateDefaultRouter invalidates a discovered default router.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) invalidateDefaultRouter(ip tcpip.Address) {
+	rtr, ok := ndp.defaultRouters[ip]
+
+	// Is the router still discovered?
+	if !ok {
+		// ...Nope, do nothing further.
+		return
+	}
+
+	rtr.invalidationTimer.Stop()
+	rtr.invalidationTimer = nil
+	close(rtr.doNotInvalidateC)
+	rtr.doNotInvalidateC = nil
+
+	delete(ndp.defaultRouters, ip)
+
+	// Let the integrator know a discovered default router is invalidated.
+	if ndp.nic.stack.ndpDisp != nil {
+		ndp.nic.stack.routeTable = ndp.nic.stack.ndpDisp.OnDefaultRouterInvalidated(ndp.nic.ID(), ip)
+	}
+}
+
+// rememberDefaultRouter remembers a newly discovered default router with IPv6
+// link-local address ip with lifetime rl.
+//
+// The router identified by ip MUST NOT already be known by the NIC.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) rememberDefaultRouter(ip tcpip.Address, rl time.Duration) {
+	if ndp.nic.stack.ndpDisp == nil {
+		return
+	}
+
+	// Inform the integrator when we discovered a default router.
+	remember, routeTable := ndp.nic.stack.ndpDisp.OnDefaultRouterDiscovered(ndp.nic.ID(), ip)
+	if !remember {
+		// Informed by the integrator to not remember the router, do
+		// nothing further.
+		return
+	}
+
+	// Used to signal the timer not to invalidate the default router (R) in
+	// a race condition. See defaultRouterState.doNotInvalidateC for more
+	// details.
+	doNotInvalidateC := make(chan struct{}, 1)
+
+	ndp.defaultRouters[ip] = defaultRouterState{
+		invalidationTimer: time.AfterFunc(rl, func() {
+			ndp.nic.stack.mu.Lock()
+			defer ndp.nic.stack.mu.Unlock()
+			ndp.nic.mu.Lock()
+			defer ndp.nic.mu.Unlock()
+
+			select {
+			case <-doNotInvalidateC:
+				return
+			default:
+			}
+
+			ndp.invalidateDefaultRouter(ip)
+		}),
+		doNotInvalidateC: doNotInvalidateC,
+	}
+
+	ndp.nic.stack.routeTable = routeTable
+}
+
+// rememberOnLinkPrefix remembers a newly discovered on-link prefix with IPv6
+// address with prefix prefix with lifetime l.
+//
+// The prefix identified by prefix MUST NOT already be known.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) rememberOnLinkPrefix(prefix tcpip.Subnet, l time.Duration) {
+	if ndp.nic.stack.ndpDisp == nil {
+		return
+	}
+
+	// Inform the integrator when we discovered an on-link prefix.
+	remember, routeTable := ndp.nic.stack.ndpDisp.OnOnLinkPrefixDiscovered(ndp.nic.ID(), prefix)
+	if !remember {
+		// Informed by the integrator to not remember the prefix, do
+		// nothing further.
+		return
+	}
+
+	// Used to signal the timer not to invalidate the on-link prefix (P) in
+	// a race condition. See onLinkPrefixState.doNotInvalidateC for more
+	// details.
+	doNotInvalidateC := make(chan struct{}, 1)
+	var timer *time.Timer
+
+	// Only create a timer if the lifetime is not infinite.
+	if l != header.NDPPrefixInformationInfiniteLifetime {
+		timer = ndp.prefixInvalidationCallback(prefix, l, doNotInvalidateC)
+	}
+
+	ndp.onLinkPrefixes[prefix] = onLinkPrefixState{
+		invalidationTimer: timer,
+		doNotInvalidateC:  doNotInvalidateC,
+	}
+
+	ndp.nic.stack.routeTable = routeTable
+}
+
+// invalidateOnLinkPrefix invalidates a discovered on-link prefix.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) invalidateOnLinkPrefix(prefix tcpip.Subnet) {
+	s, ok := ndp.onLinkPrefixes[prefix]
+
+	// Is the on-link prefix still discovered?
+	if !ok {
+		// ...Nope, do nothing further.
+		return
+	}
+
+	if s.invalidationTimer != nil {
+		s.invalidationTimer.Stop()
+		s.invalidationTimer = nil
+	}
+
+	close(s.doNotInvalidateC)
+	s.doNotInvalidateC = nil
+
+	delete(ndp.onLinkPrefixes, prefix)
+
+	// Let the integrator know a discovered on-link prefix is invalidated.
+	if ndp.nic.stack.ndpDisp != nil {
+		ndp.nic.stack.routeTable = ndp.nic.stack.ndpDisp.OnOnLinkPrefixInvalidated(ndp.nic.ID(), prefix)
+	}
+}
+
+// prefixInvalidationCallback returns a new on-link prefix invalidation timer
+// for prefix that fires after vl.
+//
+// doNotInvalidateC is used to signal the timer when it fires at the same time
+// that a prefix's valid lifetime gets refreshed. See
+// onLinkPrefixState.doNotInvalidateC for more details.
+func (ndp *ndpState) prefixInvalidationCallback(prefix tcpip.Subnet, vl time.Duration, doNotInvalidateC chan struct{}) *time.Timer {
+	return time.AfterFunc(vl, func() {
+		ndp.nic.stack.mu.Lock()
+		defer ndp.nic.stack.mu.Unlock()
+		ndp.nic.mu.Lock()
+		defer ndp.nic.mu.Unlock()
+
+		select {
+		case <-doNotInvalidateC:
+			return
+		default:
+		}
+
+		ndp.invalidateOnLinkPrefix(prefix)
+	})
+}
+
+// handleOnLinkPrefixInformation handles a Prefix Information option with
+// its on-link flag set, as per RFC 4861 section 6.3.4.
+//
+// handleOnLinkPrefixInformation assumes that the prefix this pi is for is
+// not the link-local prefix and the on-link flag is set.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) handleOnLinkPrefixInformation(pi header.NDPPrefixInformation) {
+	prefix := pi.Subnet()
+	prefixState, ok := ndp.onLinkPrefixes[prefix]
+	vl := pi.ValidLifetime()
+
+	if !ok && vl == 0 {
+		// Don't know about this prefix but it has a zero valid
+		// lifetime, so just ignore.
+		return
+	}
+
+	if !ok && vl != 0 {
+		// This is a new on-link prefix we are discovering
+		//
+		// Only remember it if we currently know about less than
+		// MaxDiscoveredOnLinkPrefixes on-link prefixes.
+		if ndp.configs.DiscoverOnLinkPrefixes && len(ndp.onLinkPrefixes) < MaxDiscoveredOnLinkPrefixes {
+			ndp.rememberOnLinkPrefix(prefix, vl)
+		}
+		return
+	}
+
+	if ok && vl == 0 {
+		// We know about the on-link prefix, but it is
+		// no longer to be considered on-link, so
+		// invalidate it.
+		ndp.invalidateOnLinkPrefix(prefix)
+		return
+	}
+
+	// This is an already discovered on-link prefix with a
+	// new non-zero valid lifetime.
+	// Update the invalidation timer.
+	timer := prefixState.invalidationTimer
+
+	if timer == nil && vl == header.NDPPrefixInformationInfiniteLifetime {
+		// Had infinite valid lifetime before and
+		// continues to have an invalid lifetime. Do
+		// nothing further.
+		return
+	}
+
+	if timer != nil && !timer.Stop() {
+		// If we reach this point, then we know the
+		// timer already fired after we took the NIC
+		// lock. Signal the timer so that once it
+		// obtains the lock, it doesn't actually
+		// invalidate the prefix as we just got a
+		// new PI that refreshes its lifetime to a
+		// non-zero value. See
+		// onLinkPrefixState.doNotInvalidateC for more
+		// details.
+		prefixState.doNotInvalidateC <- struct{}{}
+	}
+
+	if vl == header.NDPPrefixInformationInfiniteLifetime {
+		// Prefix is now valid forever so we don't need
+		// an invalidation timer.
+		prefixState.invalidationTimer = nil
+		ndp.onLinkPrefixes[prefix] = prefixState
+		return
+	}
+
+	if timer != nil {
+		// We already have a timer so just reset it to
+		// expire after the new valid lifetime.
+		timer.Reset(vl)
+		return
+	}
+
+	// We do not have a timer so just create a new one.
+	prefixState.invalidationTimer = ndp.prefixInvalidationCallback(prefix, vl, prefixState.doNotInvalidateC)
+	ndp.onLinkPrefixes[prefix] = prefixState
+}
+
+// handleAutonomousPrefixInformation handles a Prefix Information option with
+// its autonomous flag set, as per RFC 4862 section 5.5.3.
+//
+// handleAutonomousPrefixInformation assumes that the prefix this pi is for is
+// not the link-local prefix and the autonomous flag is set.
+//
+// The NIC that ndp belongs to and its associated stack MUST be locked.
+func (ndp *ndpState) handleAutonomousPrefixInformation(pi header.NDPPrefixInformation) {
+	vl := pi.ValidLifetime()
+	pl := pi.PreferredLifetime()
+
+	// If the preferred lifetime is greater than the valid lifetime,
+	// silently ignore the Prefix Information option, as per RFC 4862
+	// section 5.5.3.c.
+	if pl > vl {
+		return
+	}
+
+	prefix := pi.Subnet()
+
+	for _, ref := range ndp.nic.endpoints {
+		if ref.protocol != header.IPv6ProtocolNumber {
+			continue
+		}
+
+		if ref.configType != slaac {
+			continue
+		}
+
+		addr := ref.ep.ID().LocalAddress
+		refAddrWithPrefix := tcpip.AddressWithPrefix{Address: addr, PrefixLen: ref.ep.PrefixLen()}
+		if refAddrWithPrefix.Subnet() != prefix {
+			continue
+		}
+
+		//
+		// At this point, we know we are refreshing a SLAAC generated
+		// IPv6 address with the prefix, prefix. Do the work as outlined
+		// by RFC 4862 section 5.5.3.e.
+		//
+
+		addrState, ok := ndp.autoGenAddresses[addr]
+		if !ok {
+			panic(fmt.Sprintf("must have an autoGenAddressess entry for the SLAAC generated IPv6 address %s", addr))
+		}
+
+		// TODO(b/143713887): Handle deprecating auto-generated address
+		//                    after the preferred lifetime.
+
+		// Is the address to be cosidered valid forever.
+		if vl == header.NDPPrefixInformationInfiniteLifetime {
+			if addrState.invalidationTimer != nil {
+				// Valid lifetime was finite before, but now it
+				// is valid forever.
+				if !addrState.invalidationTimer.Stop() {
+					addrState.doNotInvalidateC <- struct{}{}
+				}
+				addrState.invalidationTimer = nil
+				addrState.validUntil = time.Time{}
+			}
+
+			ndp.autoGenAddresses[addr] = addrState
+			return
+		}
+
+		// As per RFC 4862 section 5.5.3.e, the valid lifetime of the
+		// address generated by SLAAC is as follows:
+		//
+		// 1) If the received Valid Lifetime is greater than 2 hours or
+		//    greater than RemainingLifetime, set the valid lifetime of
+		//    the address to the advertised Valid Lifetime.
+		//
+		// 2) If RemainingLifetime is less than or equal to 2 hours,
+		//    ignore the advertised Valid Lifetime.
+		//
+		// 3) Otherwise, reset the valid lifetime of the address to 2
+		//    hours.
+		var effectiveVl time.Duration
+
+		// If the address was originally set to be valid forever,
+		// assume the remaining time to be the maximum possible value.
+		var rl time.Duration
+		if addrState.invalidationTimer == nil {
+			rl = header.NDPPrefixInformationInfiniteLifetime
+		} else {
+			rl = time.Until(addrState.validUntil)
+		}
+
+		if vl > MinPrefixInformationValidLifetimeForUpdate || vl > rl {
+			// Nothing
+			effectiveVl = vl
+		} else if rl <= MinPrefixInformationValidLifetimeForUpdate {
+			// No need to do anything further.
+			ndp.autoGenAddresses[addr] = addrState
+			return
+		} else {
+			effectiveVl = MinPrefixInformationValidLifetimeForUpdate
+		}
+
+		if addrState.invalidationTimer == nil {
+			addrState.invalidationTimer = ndp.autoGenAddrInvalidationTimer(addr, effectiveVl, addrState.doNotInvalidateC)
+		} else {
+			if !addrState.invalidationTimer.Stop() {
+				addrState.doNotInvalidateC <- struct{}{}
+			}
+			addrState.invalidationTimer.Reset(effectiveVl)
+		}
+
+		addrState.validUntil = time.Now().Add(effectiveVl)
+		ndp.autoGenAddresses[addr] = addrState
+		return
+	}
+
+	// We do not already have an address within the prefix, prefix. Do the
+	// work as outlined by RFC 4862 section 5.5.3.d if n is configured
+	// to auto-generated global addresses by SLAAC.
+	if !ndp.configs.AutoGenGlobalAddresses {
+		return
+	}
+
+	// If we do not already have an address for this prefix and the valid
+	// lifetime is 0, no need to do anything further, as per RFC 4862
+	// section 5.5.3.d.
+	if vl == 0 {
+		return
+	}
+
+	// Make sure the prefix is valid (as far as its length is concerned) to
+	// generate a valid IPv6 address from an interface identifier (IID), as
+	// per RFC 4862 sectiion 5.5.3.d.
+	if prefix.Prefix() != validPrefixLenForAutoGen {
+		return
+	}
+
+	linkAddr := ndp.nic.linkEP.LinkAddress()
+	// Only attempt to generate an interface-specific IID if we have a valid
+	// link address.
+	//
+	// TODO(b/141011931): Validate a LinkEndpoint's link address
+	// (provided by LinkEndpoint.LinkAddress) before reaching this
+	// point.
+	if !header.IsValidUnicastEthernetAddress(linkAddr) {
+		return
+	}
+
+	// Generate an address within prefix from the EUI-64 of n's Ethernet MAC
+	// address.
+	addrBytes := make([]byte, header.IPv6AddressSize)
+	copy(addrBytes[:iidOffsetInIPv6Address], prefix.ID()[:iidOffsetInIPv6Address])
+	header.EthernetAdddressToEUI64IntoBuf(linkAddr, addrBytes[iidOffsetInIPv6Address:])
+	addr := tcpip.Address(addrBytes)
+	addrWithPrefix := tcpip.AddressWithPrefix{
+		Address:   addr,
+		PrefixLen: validPrefixLenForAutoGen,
+	}
+
+	// If the nic already has this address, do nothing further.
+	if ndp.nic.hasPermanentAddrLocked(addr) {
+		return
+	}
+
+	// Inform the integrator that we have a new SLAAC address.
+	if ndp.nic.stack.ndpDisp == nil {
+		return
+	}
+	if !ndp.nic.stack.ndpDisp.OnAutoGenAddress(ndp.nic.ID(), addrWithPrefix) {
+		// Informed by the integrator not to add the address.
+		return
+	}
+
+	{
+		_, err := ndp.nic.addAddressLocked(tcpip.ProtocolAddress{
+			Protocol:          header.IPv6ProtocolNumber,
+			AddressWithPrefix: addrWithPrefix,
+		}, CanBePrimaryEndpoint, permanent, slaac)
+		if err == tcpip.ErrDuplicateAddress {
+			// Must already have an identical non-slaac generated
+			// address - do nothing further.
+			return
+		} else if err != nil {
+			panic(err)
+		}
+	}
+
+	//
+	// Setup the timers to deprecate and invalidate this newly generated
+	// address.
+	//
+
+	// TODO(b/143713887): Handle deprecating auto-generated addresses
+	//                    after the preferred lifetime.
+
+	doNotInvalidateC := make(chan struct{}, 1)
+	var vTimer *time.Timer
+	if vl != header.NDPPrefixInformationInfiniteLifetime {
+		vTimer = ndp.autoGenAddrInvalidationTimer(addr, vl, doNotInvalidateC)
+	}
+
+	ndp.autoGenAddresses[addr] = autoGenAddressState{
+		invalidationTimer: vTimer,
+		doNotInvalidateC:  doNotInvalidateC,
+		validUntil:        time.Now().Add(vl),
+	}
+}
+
+// invalidateAutoGenAddress invalidates an auto-generated address.
+//
+// The NIC that ndp belongs to MUST be locked.
+func (ndp *ndpState) invalidateAutoGenAddress(addr tcpip.Address) {
+	if !ndp.cleanupAutoGenAddrResourcesAndNotify(addr) {
+		return
+	}
+
+	ndp.nic.removePermanentAddressLocked(addr)
+}
+
+// cleanupAutoGenAddrResourcesAndNotify cleans up an invalidated auto-generated
+// address's resources from ndp. If the stack has an NDP dispatcher, it will
+// be notified that addr has been invalidated.
+//
+// Returns true if ndp had resources for addr to cleanup.
+//
+// The NIC that ndp belongs to MUST be locked.
+func (ndp *ndpState) cleanupAutoGenAddrResourcesAndNotify(addr tcpip.Address) bool {
+	state, ok := ndp.autoGenAddresses[addr]
+
+	if !ok {
+		return false
+	}
+
+	if state.invalidationTimer != nil {
+		state.invalidationTimer.Stop()
+		state.invalidationTimer = nil
+	}
+
+	close(state.doNotInvalidateC)
+	state.doNotInvalidateC = nil
+
+	delete(ndp.autoGenAddresses, addr)
+
+	if ndp.nic.stack.ndpDisp != nil {
+		ndp.nic.stack.ndpDisp.OnAutoGenAddressInvalidated(ndp.nic.ID(), tcpip.AddressWithPrefix{
+			Address:   addr,
+			PrefixLen: validPrefixLenForAutoGen,
+		})
+	}
+
+	return true
+}
+
+// autoGenAddrInvalidationTimer returns a new invalidation timer for an
+// auto-generated address that fires after vl.
+//
+// doNotInvalidateC is used to signal the timer when it fires at the same time
+// that an auto-generated address's valid lifetime gets refreshed. See
+// autoGenAddrState.doNotInvalidateC for more details.
+func (ndp *ndpState) autoGenAddrInvalidationTimer(addr tcpip.Address, vl time.Duration, doNotInvalidateC chan struct{}) *time.Timer {
+	return time.AfterFunc(vl, func() {
+		ndp.nic.mu.Lock()
+		defer ndp.nic.mu.Unlock()
+
+		select {
+		case <-doNotInvalidateC:
+			return
+		default:
+		}
+
+		ndp.invalidateAutoGenAddress(addr)
+	})
 }
