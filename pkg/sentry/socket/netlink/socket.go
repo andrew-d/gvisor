@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
@@ -53,6 +54,8 @@ const (
 	maxSendBufferSize = 4 << 20 // 4MB
 )
 
+var errNoFilter = syserr.New("no filter attached", linux.ENOENT)
+
 // netlinkSocketDevice is the netlink socket virtual device.
 var netlinkSocketDevice = device.NewAnonDevice()
 
@@ -61,7 +64,7 @@ var netlinkSocketDevice = device.NewAnonDevice()
 // This implementation only supports userspace sending and receiving messages
 // to/from the kernel.
 //
-// Socket implements socket.Socket.
+// Socket implements socket.Socket and transport.Credentialer.
 //
 // +stateify savable
 type Socket struct {
@@ -104,9 +107,19 @@ type Socket struct {
 	// sendBufferSize is the send buffer "size". We don't actually have a
 	// fixed buffer but only consume this many bytes.
 	sendBufferSize uint32
+
+	// passcred indicates if this socket wants SCM credentials.
+	passcred bool
+
+	// filter indicates that this socket has a BPF filter "installed".
+	//
+	// TODO(gvisor.dev/issue/1119): We don't actually support filtering,
+	// this is just bookkeeping for tracking add/remove.
+	filter bool
 }
 
 var _ socket.Socket = (*Socket)(nil)
+var _ transport.Credentialer = (*Socket)(nil)
 
 // NewSocket creates a new Socket.
 func NewSocket(t *kernel.Task, skType linux.SockType, protocol Protocol) (*Socket, *syserr.Error) {
@@ -170,6 +183,22 @@ func (s *Socket) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (s *Socket) EventUnregister(e *waiter.Entry) {
 	s.ep.EventUnregister(e)
+}
+
+// Passcred implements transport.Credentialer.Passcred.
+func (s *Socket) Passcred() bool {
+	s.mu.Lock()
+	passcred := s.passcred
+	s.mu.Unlock()
+	return passcred
+}
+
+// ConnectedPasscred implements transport.Credentialer.ConnectedPasscred.
+func (s *Socket) ConnectedPasscred() bool {
+	// This socket is connected to the kernel, which doesn't need creds.
+	//
+	// This is arbitrary, as ConnectedPasscred on this type has no callers.
+	return false
 }
 
 // Ioctl implements fs.FileOperations.Ioctl.
@@ -309,9 +338,20 @@ func (s *Socket) GetSockOpt(t *kernel.Task, level int, name int, outPtr usermem.
 			// We don't have limit on receiving size.
 			return int32(math.MaxInt32), nil
 
+		case linux.SO_PASSCRED:
+			if outLen < sizeOfInt32 {
+				return nil, syserr.ErrInvalidArgument
+			}
+			var passcred int32
+			if s.Passcred() {
+				passcred = 1
+			}
+			return passcred, nil
+
 		default:
 			socket.GetSockOptEmitUnimplementedEvent(t, name)
 		}
+
 	case linux.SOL_NETLINK:
 		switch name {
 		case linux.NETLINK_BROADCAST_ERROR,
@@ -348,6 +388,7 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			s.sendBufferSize = size
 			s.mu.Unlock()
 			return nil
+
 		case linux.SO_RCVBUF:
 			if len(opt) < sizeOfInt32 {
 				return syserr.ErrInvalidArgument
@@ -355,6 +396,52 @@ func (s *Socket) SetSockOpt(t *kernel.Task, level int, name int, opt []byte) *sy
 			// We don't have limit on receiving size. So just accept anything as
 			// valid for compatibility.
 			return nil
+
+		case linux.SO_PASSCRED:
+			if len(opt) < sizeOfInt32 {
+				return syserr.ErrInvalidArgument
+			}
+			passcred := usermem.ByteOrder.Uint32(opt)
+
+			s.mu.Lock()
+			s.passcred = passcred != 0
+			s.mu.Unlock()
+			return nil
+
+		case linux.SO_ATTACH_FILTER:
+			// TODO(gvisor.dev/issue/1119): We don't actually
+			// support filtering. If this socket can't ever send
+			// messages, then there is nothing to filter and we can
+			// advertise support. Otherwise, be conservative and
+			// return an error.
+			if s.protocol.CanSend() {
+				socket.SetSockOptEmitUnimplementedEvent(t, name)
+				return syserr.ErrProtocolNotAvailable
+			}
+
+			s.mu.Lock()
+			s.filter = true
+			s.mu.Unlock()
+			return nil
+
+		case linux.SO_DETACH_FILTER:
+			// TODO(gvisor.dev/issue/1119): See above.
+			if s.protocol.CanSend() {
+				socket.SetSockOptEmitUnimplementedEvent(t, name)
+				return syserr.ErrProtocolNotAvailable
+			}
+
+			s.mu.Lock()
+			filter := s.filter
+			s.filter = false
+			s.mu.Unlock()
+
+			if !filter {
+				return errNoFilter
+			}
+
+			return nil
+
 		default:
 			socket.SetSockOptEmitUnimplementedEvent(t, name)
 		}
@@ -483,6 +570,26 @@ func (s *Socket) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _
 	})
 }
 
+// kernelSCM implements control.SCMCredentials with credentials that represent
+// the kernel itself rather than a Task.
+//
+// +stateify savable
+type kernelSCM struct{}
+
+// Equals implements transport.CredentialsControlMessage.Equals.
+func (kernelSCM) Equals(oc transport.CredentialsControlMessage) bool {
+	_, ok := oc.(kernelSCM)
+	return ok
+}
+
+// Credentials implements control.SCMCredentials.Credentials.
+func (kernelSCM) Credentials(*kernel.Task) (kernel.ThreadID, auth.UID, auth.GID) {
+	return 0, auth.RootUID, auth.RootGID
+}
+
+// kernelCreds is the concrete version of kernelSCM used in all creds.
+var kernelCreds = &kernelSCM{}
+
 // sendResponse sends the response messages in ms back to userspace.
 func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error {
 	// Linux combines multiple netlink messages into a single datagram.
@@ -491,10 +598,15 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 		bufs = append(bufs, m.Finalize())
 	}
 
+	// All messages are from the kernel.
+	cms := transport.ControlMessages{
+		Credentials: kernelCreds,
+	}
+
 	if len(bufs) > 0 {
 		// RecvMsg never receives the address, so we don't need to send
 		// one.
-		_, notify, err := s.connection.Send(bufs, transport.ControlMessages{}, tcpip.FullAddress{})
+		_, notify, err := s.connection.Send(bufs, cms, tcpip.FullAddress{})
 		// If the buffer is full, we simply drop messages, just like
 		// Linux.
 		if err != nil && err != syserr.ErrWouldBlock {
@@ -521,7 +633,7 @@ func (s *Socket) sendResponse(ctx context.Context, ms *MessageSet) *syserr.Error
 		// Add the dump_done_errno payload.
 		m.Put(int64(0))
 
-		_, notify, err := s.connection.Send([][]byte{m.Finalize()}, transport.ControlMessages{}, tcpip.FullAddress{})
+		_, notify, err := s.connection.Send([][]byte{m.Finalize()}, cms, tcpip.FullAddress{})
 		if err != nil && err != syserr.ErrWouldBlock {
 			return err
 		}

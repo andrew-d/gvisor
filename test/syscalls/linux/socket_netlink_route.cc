@@ -41,112 +41,7 @@ namespace {
 using ::testing::AnyOf;
 using ::testing::Eq;
 
-// Netlink sockets must be SOCK_DGRAM or SOCK_RAW.
-TEST(NetlinkRouteTest, Types) {
-  EXPECT_THAT(socket(AF_NETLINK, SOCK_STREAM, NETLINK_ROUTE),
-              SyscallFailsWithErrno(ESOCKTNOSUPPORT));
-  EXPECT_THAT(socket(AF_NETLINK, SOCK_SEQPACKET, NETLINK_ROUTE),
-              SyscallFailsWithErrno(ESOCKTNOSUPPORT));
-  EXPECT_THAT(socket(AF_NETLINK, SOCK_RDM, NETLINK_ROUTE),
-              SyscallFailsWithErrno(ESOCKTNOSUPPORT));
-  EXPECT_THAT(socket(AF_NETLINK, SOCK_DCCP, NETLINK_ROUTE),
-              SyscallFailsWithErrno(ESOCKTNOSUPPORT));
-  EXPECT_THAT(socket(AF_NETLINK, SOCK_PACKET, NETLINK_ROUTE),
-              SyscallFailsWithErrno(ESOCKTNOSUPPORT));
-
-  int fd;
-  EXPECT_THAT(fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE),
-              SyscallSucceeds());
-  EXPECT_THAT(close(fd), SyscallSucceeds());
-
-  EXPECT_THAT(fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE),
-              SyscallSucceeds());
-  EXPECT_THAT(close(fd), SyscallSucceeds());
-}
-
-TEST(NetlinkRouteTest, AutomaticPort) {
-  FileDescriptor fd =
-      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE));
-
-  struct sockaddr_nl addr = {};
-  addr.nl_family = AF_NETLINK;
-
-  EXPECT_THAT(
-      bind(fd.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)),
-      SyscallSucceeds());
-
-  socklen_t addrlen = sizeof(addr);
-  EXPECT_THAT(getsockname(fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
-                          &addrlen),
-              SyscallSucceeds());
-  EXPECT_EQ(addrlen, sizeof(addr));
-  // This is the only netlink socket in the process, so it should get the PID as
-  // the port id.
-  //
-  // N.B. Another process could theoretically have explicitly reserved our pid
-  // as a port ID, but that is very unlikely.
-  EXPECT_EQ(addr.nl_pid, getpid());
-}
-
-// Calling connect automatically binds to an automatic port.
-TEST(NetlinkRouteTest, ConnectBinds) {
-  FileDescriptor fd =
-      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE));
-
-  struct sockaddr_nl addr = {};
-  addr.nl_family = AF_NETLINK;
-
-  EXPECT_THAT(connect(fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
-                      sizeof(addr)),
-              SyscallSucceeds());
-
-  socklen_t addrlen = sizeof(addr);
-  EXPECT_THAT(getsockname(fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
-                          &addrlen),
-              SyscallSucceeds());
-  EXPECT_EQ(addrlen, sizeof(addr));
-
-  // Each test is running in a pid namespace, so another process can explicitly
-  // reserve our pid as a port ID. In this case, a negative portid value will be
-  // set.
-  if (static_cast<pid_t>(addr.nl_pid) > 0) {
-    EXPECT_EQ(addr.nl_pid, getpid());
-  }
-
-  memset(&addr, 0, sizeof(addr));
-  addr.nl_family = AF_NETLINK;
-
-  // Connecting again is allowed, but keeps the same port.
-  EXPECT_THAT(connect(fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
-                      sizeof(addr)),
-              SyscallSucceeds());
-
-  addrlen = sizeof(addr);
-  EXPECT_THAT(getsockname(fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
-                          &addrlen),
-              SyscallSucceeds());
-  EXPECT_EQ(addrlen, sizeof(addr));
-  EXPECT_EQ(addr.nl_pid, getpid());
-}
-
-TEST(NetlinkRouteTest, GetPeerName) {
-  FileDescriptor fd =
-      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE));
-
-  struct sockaddr_nl addr = {};
-  socklen_t addrlen = sizeof(addr);
-
-  EXPECT_THAT(getpeername(fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
-                          &addrlen),
-              SyscallSucceeds());
-
-  EXPECT_EQ(addrlen, sizeof(addr));
-  EXPECT_EQ(addr.nl_family, AF_NETLINK);
-  // Peer is the kernel if we didn't connect elsewhere.
-  EXPECT_EQ(addr.nl_pid, 0);
-}
-
-// Parameters for GetSockOpt test. They are:
+// Parameters for SockOptTest. They are:
 // 0: Socket option to query.
 // 1: A predicate to run on the returned sockopt value. Should return true if
 //    the value is considered ok.
@@ -195,7 +90,8 @@ INSTANTIATE_TEST_SUITE_P(
         std::make_tuple(SO_DOMAIN, IsEqual(AF_NETLINK),
                         absl::StrFormat("AF_NETLINK (%d)", AF_NETLINK)),
         std::make_tuple(SO_PROTOCOL, IsEqual(NETLINK_ROUTE),
-                        absl::StrFormat("NETLINK_ROUTE (%d)", NETLINK_ROUTE))));
+                        absl::StrFormat("NETLINK_ROUTE (%d)", NETLINK_ROUTE)),
+        std::make_tuple(SO_PASSCRED, IsEqual(0), "0")));
 
 // Validates the reponses to RTM_GETLINK + NLM_F_DUMP.
 void CheckGetLinkResponse(const struct nlmsghdr* hdr, int seq, int port) {
@@ -218,7 +114,8 @@ void CheckGetLinkResponse(const struct nlmsghdr* hdr, int seq, int port) {
 }
 
 TEST(NetlinkRouteTest, GetLinkDump) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
 
   struct request {
@@ -259,7 +156,8 @@ TEST(NetlinkRouteTest, GetLinkDump) {
 }
 
 TEST(NetlinkRouteTest, MsgHdrMsgUnsuppType) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   struct request {
     struct nlmsghdr hdr;
@@ -292,7 +190,8 @@ TEST(NetlinkRouteTest, MsgHdrMsgUnsuppType) {
 }
 
 TEST(NetlinkRouteTest, MsgHdrMsgTrunc) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   struct request {
     struct nlmsghdr hdr;
@@ -331,7 +230,8 @@ TEST(NetlinkRouteTest, MsgHdrMsgTrunc) {
 }
 
 TEST(NetlinkRouteTest, MsgTruncMsgHdrMsgTrunc) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   struct request {
     struct nlmsghdr hdr;
@@ -372,7 +272,8 @@ TEST(NetlinkRouteTest, MsgTruncMsgHdrMsgTrunc) {
 }
 
 TEST(NetlinkRouteTest, ControlMessageIgnored) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
 
   struct request {
@@ -407,7 +308,8 @@ TEST(NetlinkRouteTest, ControlMessageIgnored) {
 }
 
 TEST(NetlinkRouteTest, GetAddrDump) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
 
   struct request {
@@ -467,7 +369,8 @@ TEST(NetlinkRouteTest, LookupAll) {
 
 // GetRouteDump tests a RTM_GETROUTE + NLM_F_DUMP request.
 TEST(NetlinkRouteTest, GetRouteDump) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
   uint32_t port = ASSERT_NO_ERRNO_AND_VALUE(NetlinkPortID(fd.get()));
 
   struct request {
@@ -543,7 +446,8 @@ TEST(NetlinkRouteTest, GetRouteDump) {
 // buffer. MSG_TRUNC with a zero length buffer should consume subsequent
 // messages off the socket.
 TEST(NetlinkRouteTest, RecvmsgTrunc) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   struct request {
     struct nlmsghdr hdr;
@@ -619,7 +523,8 @@ TEST(NetlinkRouteTest, RecvmsgTrunc) {
 // it, so a properly sized buffer can be allocated to store the message. This
 // test tests that scenario.
 TEST(NetlinkRouteTest, RecvmsgTruncPeek) {
-  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket());
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
 
   struct request {
     struct nlmsghdr hdr;
@@ -690,6 +595,116 @@ TEST(NetlinkRouteTest, RecvmsgTruncPeek) {
       type = hdr->nlmsg_type;
     }
   } while (type != NLMSG_DONE && type != NLMSG_ERROR);
+}
+
+// No SCM_CREDENTIALS are received without SO_PASSCRED set.
+TEST(NetlinkRouteTest, NoPasscredNoCreds) {
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  int zero = 0;
+  ASSERT_THAT(
+      setsockopt(fd.get(), SOL_SOCKET, SO_PASSCRED, &zero, sizeof(zero)),
+      SyscallSucceeds());
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtgenmsg rgm;
+  };
+
+  constexpr uint32_t kSeq = 12345;
+
+  struct request req;
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETADDR;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.rgm.rtgen_family = AF_UNSPEC;
+
+  struct iovec iov = {};
+  iov.iov_base = &req;
+  iov.iov_len = sizeof(req);
+
+  struct msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(fd.get(), &msg, 0), SyscallSucceeds());
+
+  iov.iov_base = NULL;
+  iov.iov_len = 0;
+
+  char control[CMSG_SPACE(sizeof(struct ucred))] = {};
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  // Note: This test assumes at least one message is returned by the
+  // RTM_GETADDR request.
+  ASSERT_THAT(RetryEINTR(recvmsg)(fd.get(), &msg, 0), SyscallSucceeds());
+
+  // No control messages.
+  EXPECT_EQ(CMSG_FIRSTHDR(&msg), nullptr);
+}
+
+// SCM_CREDENTIALS are received with SO_PASSCRED set.
+TEST(NetlinkRouteTest, PasscredCreds) {
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+
+  int one = 1;
+  ASSERT_THAT(setsockopt(fd.get(), SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)),
+              SyscallSucceeds());
+
+  struct request {
+    struct nlmsghdr hdr;
+    struct rtgenmsg rgm;
+  };
+
+  constexpr uint32_t kSeq = 12345;
+
+  struct request req;
+  req.hdr.nlmsg_len = sizeof(req);
+  req.hdr.nlmsg_type = RTM_GETADDR;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.hdr.nlmsg_seq = kSeq;
+  req.rgm.rtgen_family = AF_UNSPEC;
+
+  struct iovec iov = {};
+  iov.iov_base = &req;
+  iov.iov_len = sizeof(req);
+
+  struct msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(fd.get(), &msg, 0), SyscallSucceeds());
+
+  iov.iov_base = NULL;
+  iov.iov_len = 0;
+
+  char control[CMSG_SPACE(sizeof(struct ucred))] = {};
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  // Note: This test assumes at least one message is returned by the
+  // RTM_GETADDR request.
+  ASSERT_THAT(RetryEINTR(recvmsg)(fd.get(), &msg, 0), SyscallSucceeds());
+
+  struct ucred creds;
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  ASSERT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(creds)));
+  ASSERT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  ASSERT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+
+  memcpy(&creds, CMSG_DATA(cmsg), sizeof(creds));
+
+  // The peer is the kernel, which is "PID" 0.
+  EXPECT_EQ(creds.pid, 0);
+  // The kernel identifies as root. Also allow nobody in case this test is
+  // running in a userns without root mapped.
+  EXPECT_THAT(creds.uid, AnyOf(Eq(0), Eq(65534)));
+  EXPECT_THAT(creds.gid, AnyOf(Eq(0), Eq(65534)));
 }
 
 }  // namespace
